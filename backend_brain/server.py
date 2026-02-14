@@ -10,52 +10,31 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+from contextlib import asynccontextmanager
 
-# 1. Path Setup
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-# Load environment variables
-load_dotenv()
-
-# Global AI instances (Initialized as None for lazy loading)
+# Define global variables for the modules
 brain = None
 vision = None
 mouth = None
 
-# ==========================================
-# LIFESPAN MANAGER (The Fix for Render Timeouts)
-# ==========================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    This logic runs in the background. It allows the server to bind 
-    to the port immediately so Render doesn't kill the deployment.
-    """
+    # This runs AFTER the port is already open and Render is happy
     global brain, vision, mouth
-    print("🤖 Booting AI Core Systems in background...")
+    print("🤖 Port is open! Now loading AI Models in background...")
     
-    # Import inside lifespan to prevent slow startup blocking port binding
+    # Lazy import: These only load when the server is already live
     from modules.brain import BrainSystem
     from modules.eyes import VisionSystem
     from modules.mouth import Mouth
     
-    try:
-        brain = BrainSystem()
-        vision = VisionSystem()
-        mouth = Mouth(voice="af_sarah", speed=1.0)
-        print("✅ AI Systems initialized and ready.")
-    except Exception as e:
-        print(f"❌ Failed to initialize AI modules: {e}")
-        
+    brain = BrainSystem()
+    vision = VisionSystem()
+    mouth = Mouth()
+    print("✅ AI Core Systems Ready.")
     yield
-    # Shutdown logic (optional)
-    if vision:
-        vision.stop()
 
-# ==========================================
-# APP INITIALIZATION
-# ==========================================
-app = FastAPI(title="Avaani Real-Time Core", lifespan=lifespan)
+app = FastAPI(lifespan=lifespan)
 
 # CORS (Crucial for Vercel/Frontend communication)
 app.add_middleware(
@@ -166,6 +145,6 @@ def health_check():
     }
 
 if __name__ == "__main__":
-    # REQUIRED FOR RENDER: Bind to the dynamic $PORT environment variable
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("server:app", host="0.0.0.0", port=port, log_level="info")
+    # CRITICAL: Use the PORT variable Render gives you
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
