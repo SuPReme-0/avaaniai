@@ -8,7 +8,7 @@ import math
 from collections import deque, Counter
 from ultralytics import YOLO
 from deepface import DeepFace
-from deepface.commons import distance as dst # For manual vector comparison
+from deepface.modules import verification as dst # For manual vector comparison
 
 # ==========================================
 # CONFIGURATION
