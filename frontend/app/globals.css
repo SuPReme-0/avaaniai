@@ -1,10 +1,15 @@
 @import "tailwindcss";
 
 @theme {
+  /* Your Original Theme Colors & Anims */
   --color-pink-soft: #fbcfe8;
   --color-rose-glow: #fda4af;
   --animate-ripple: ripple 1.5s infinite ease-out;
   --animate-float: float 6s infinite ease-in-out;
+  
+  /* Added Avaani Theme Colors */
+  --color-avaani-cyan: #22d3ee;
+  --color-avaani-pink: #f43f5e;
 }
 
 @keyframes ripple {
@@ -17,18 +22,41 @@
   50% { transform: translateY(-10px); }
 }
 
-body {
-  background-color: black !important;
-  touch-action: none; 
-}
-
 @keyframes wave {
   0%, 100% { height: 4px; }
   50% { height: 16px; }
 }
+
+/* Base UI Fixes */
+:root {
+  color-scheme: dark;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background-color: black !important;
+  color: white;
+  overflow: hidden; /* Prevents accidental scrolling on mobile */
+  touch-action: none; /* Prevents double-tap zoom which can lag the AI controls */
+}
+
+/* Your original wave bar animation for the AI status */
 .wave-bar {
   width: 3px;
-  background-color: #fda4af;
+  background-color: var(--color-rose-glow);
   border-radius: 99px;
   animation: wave 1s infinite ease-in-out;
+}
+
+/* Smooth transitions for the Subtitles HUD */
+.hud-fade-in {
+  animation: fadeIn 0.5s ease-out forwards;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translate(-50%, -10px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
 }
