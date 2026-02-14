@@ -16,9 +16,10 @@ import { IdleBodyController } from "@/features/body/IdleBodyController";
 import { IdleFaceController } from "@/features/body/FaceController";
 import { IdleHandController } from "@/features/body/IdleHandController";
 import { LiveContextController } from "@/features/live/LiveContextController";
+import { EmotionName } from "@/features/emotions/emotionPresets";
 
 interface VrmStageProps {
-  emotion?: string; // Optional prop to set emotion declaratively
+  emotion?: EmotionName;
 }
 
 const VrmStage = forwardRef((props: VrmStageProps, ref) => {
@@ -28,13 +29,15 @@ const VrmStage = forwardRef((props: VrmStageProps, ref) => {
   
   // High-performance animation refs
   const mouthOpenTarget = useRef(0);
-  const currentExpression = useRef<string>("neutral");
+  const currentEmotion = useRef<EmotionName>("neutral");
+  
+  // Reference to internal controllers for direct manipulation
+  const controllersRef = useRef<any>({});
 
   // ---------------------------------------------------------
-  // 1. IMPERATIVE API (For StreamManager to call)
+  // 1. IMPERATIVE API (Connected to StreamManager & Dashboard)
   // ---------------------------------------------------------
   useImperativeHandle(ref, () => ({
-    // Triggered when audio chunks arrive from Mouth.py
     triggerMouthPop: () => {
       mouthOpenTarget.current = 0.85; 
       setTimeout(() => {
@@ -44,9 +47,16 @@ const VrmStage = forwardRef((props: VrmStageProps, ref) => {
     stopMouth: () => {
       mouthOpenTarget.current = 0;
     },
-    // Set character expression (happy, sad, angry, neutral)
-    setExpression: (name: string) => {
-      currentExpression.current = name.toLowerCase();
+    // The "Soul" Update: Syncs face, body, and pose
+    setExpression: (name: EmotionName) => {
+      const emo = name.toLowerCase() as EmotionName;
+      currentEmotion.current = emo;
+      
+      // Update individual controller states immediately
+      const c = controllersRef.current;
+      c.face?.setEmotion(emo);
+      c.body?.setEmotion(emo);
+      c.pose?.setEmotion(emo);
     }
   }));
 
@@ -55,7 +65,6 @@ const VrmStage = forwardRef((props: VrmStageProps, ref) => {
     const canvas = canvasRef.current;
     if (!canvas || rendererRef.current) return;
 
-    // --- SETUP THREE.JS ---
     const renderer = createRenderer(canvas);
     rendererRef.current = renderer;
     const scene = createScene();
@@ -69,11 +78,8 @@ const VrmStage = forwardRef((props: VrmStageProps, ref) => {
     scene.add(avatarRoot);
 
     let vrm: VRM | null = null;
-    const controllers: any = { 
-      body: null, physics: null, pose: null, idle: null, face: null, hand: null, live: null 
-    };
 
-    // Handle Responsive Resize
+    // Responsive Logic
     const onResize = () => {
       if (!canvas.parentElement) return;
       const w = canvas.parentElement.clientWidth;
@@ -85,7 +91,6 @@ const VrmStage = forwardRef((props: VrmStageProps, ref) => {
     };
     window.addEventListener("resize", onResize);
 
-    // Initial load
     (async () => {
       try {
         const loaded = (await loadVrm("/models/character.vrm")) as VRM | null;
@@ -93,14 +98,15 @@ const VrmStage = forwardRef((props: VrmStageProps, ref) => {
         vrm = loaded;
         avatarRoot.add(vrm.scene);
 
-        // Initialize Specialized Controllers
-        controllers.pose = new PoseController(vrm);
-        controllers.body = new BodyController(vrm);
-        controllers.physics = new PhysicsController(vrm);
-        controllers.live = new LiveContextController(vrm);
-        controllers.face = new IdleFaceController(vrm);
-        controllers.hand = new IdleHandController(vrm);
-        controllers.idle = new IdleBodyController(vrm, {
+        // Initialize Specialized Controllers with shared ref
+        const c = controllersRef.current;
+        c.pose = new PoseController(vrm);
+        c.body = new BodyController(vrm);
+        c.physics = new PhysicsController(vrm);
+        c.live = new LiveContextController(vrm);
+        c.face = new IdleFaceController(vrm);
+        c.hand = new IdleHandController(vrm);
+        c.idle = new IdleBodyController(vrm, {
           intensity: 0.9, breathe: 1.0, sway: 1.0, head: 0.9, slerp: 0.22,
         });
 
@@ -111,7 +117,6 @@ const VrmStage = forwardRef((props: VrmStageProps, ref) => {
       }
     })();
 
-    // --- ANIMATION LOOP ---
     const animate = () => {
       if (!mounted) return;
       rafRef.current = requestAnimationFrame(animate);
@@ -120,39 +125,40 @@ const VrmStage = forwardRef((props: VrmStageProps, ref) => {
       const t = clock.getElapsedTime();
 
       if (vrm) {
-        // 1. Run Baseline Motion (Breathing, Swaying)
-        controllers.pose?.update?.(dt);
-        controllers.body?.update?.(dt);
-        controllers.live?.update(dt);
-        controllers.idle?.update?.(dt);
-        controllers.hand?.update(dt);
-        controllers.physics?.applyWind?.(t);
+        const c = controllersRef.current;
 
-        // 2. Handle Gaze
-        const gazeScore = controllers.live?.getGazeScore?.() ?? 0;
-        const visible = controllers.live?.getTrackingVisible?.() ?? false;
-        controllers.face?.setLiveGaze({ strength: gazeScore, visible });
-        controllers.face?.update(dt);
+        // 1. BASELINE UPDATES (Body scale, wind, hand sway)
+        c.body?.update(dt);
+        c.physics?.applyWind?.(t);
+        c.hand?.update(dt);
+        c.live?.update(dt);
 
-        // 3. OVERRIDE EXPRESSIONS (The "Soul" layer)
+        // 2. POSE & IDLE (Shoulder slump, breathing)
+        // PoseController now uses the currentEmotion internally
+        c.pose?.update(dt);
+        
+        // Idle intensity reacts to emotion energy via the dashboard's logic if needed,
+        // or we can manually scale it here.
+        c.idle?.update?.(dt);
+
+        // 3. EYE & BLINK LOGIC
+        const gazeScore = c.live?.getGazeScore?.() ?? 0;
+        const visible = c.live?.getTrackingVisible?.() ?? false;
+        c.face?.setLiveGaze({ strength: gazeScore, visible });
+        c.face?.update(dt);
+
+        // 4. MANUAL OVERRIDES (Mouth & Blendshapes)
         if (vrm.expressionManager) {
-          // A. SMOOTH LIP SYNC
+          // A. LIP SYNC
           const currentA = vrm.expressionManager.getValue("aa") ?? 0;
           const nextMouthValue = THREE.MathUtils.lerp(currentA, mouthOpenTarget.current, 0.4);
           
-          // Apply to shapes (compatible with VRM 0.x and 1.0)
           vrm.expressionManager.setValue("aa", nextMouthValue);
-          vrm.expressionManager.setValue("ih", nextMouthValue * 0.1); // Slight width adjustment
+          vrm.expressionManager.setValue("ih", nextMouthValue * 0.1); 
           
-          // B. EMOTIONAL OVERRIDE
-          // We clear other expressions to avoid "masking"
-          const expressions = ["happy", "sad", "angry", "relaxed", "surprised"];
-          expressions.forEach(exp => {
-            const target = exp === currentExpression.current ? 1.0 : 0.0;
-            const cur = vrm!.expressionManager!.getValue(exp) ?? 0;
-            vrm!.expressionManager!.setValue(exp, THREE.MathUtils.lerp(cur, target, 0.1));
-          });
-
+          // B. REFRESH EXPRESSION MANAGER
+          // The FaceController already updates the facial muscles during its .update(dt) call,
+          // so we only need one final update call.
           vrm.expressionManager.update();
         }
 
@@ -178,7 +184,6 @@ const VrmStage = forwardRef((props: VrmStageProps, ref) => {
   return (
     <div className="w-full h-full relative overflow-hidden bg-transparent">
       <canvas ref={canvasRef} className="w-full h-full block touch-none" />
-      {/* Visual guidance for eye tracking can be overlayed here */}
     </div>
   );
 });

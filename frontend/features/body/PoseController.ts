@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { emotionPresets, EmotionName } from "../emotions/emotionPresets";
 
 type PoseConfig = {
   shoulderDown: number;
@@ -20,37 +21,57 @@ const DEFAULT_CONFIG: PoseConfig = {
 
 export class PoseController {
   private vrm: any;
-  private config: PoseConfig;
+  private currentEmotion: EmotionName = "neutral";
   private isEnabled = true;
   private rest = new Map<string, THREE.Quaternion>();
+  private currentConfig: PoseConfig = { ...DEFAULT_CONFIG };
 
   private _euler = new THREE.Euler();
   private _qOffset = new THREE.Quaternion();
 
-  constructor(vrm: any, config: Partial<PoseConfig> = {}) {
+  constructor(vrm: any) {
     this.vrm = vrm;
-    this.config = { ...DEFAULT_CONFIG, ...config };
     this.cacheRestPose();
   }
 
-  public update(_dt: number) {
+  public setEmotion(name: EmotionName) {
+    this.currentEmotion = name;
+  }
+
+  public update(dt: number) {
     if (!this.isEnabled || !this.vrm?.humanoid) return;
+    
+    this.interpolatePoseConfig(dt);
     this.applyNaturalPose();
+  }
+
+  private interpolatePoseConfig(dt: number) {
+    const energy = emotionPresets[this.currentEmotion].energy;
+    const k = 1 - Math.exp(-4 * dt); // Smooth transition speed
+
+    // Adjusting the pose based on energy levels
+    // Sad (low energy) = Shoulders drop more, arms come in
+    const targetShoulderDown = energy < 0.4 ? 0.95 : 0.82;
+    const targetArmInward = energy < 0.4 ? 0.35 : 0.22;
+    // Surprised/Angry (high energy) = Shoulders forward
+    const targetShoulderForward = energy > 0.8 ? 0.45 : 0.25;
+
+    this.currentConfig.shoulderDown += (targetShoulderDown - this.currentConfig.shoulderDown) * k;
+    this.currentConfig.armInward += (targetArmInward - this.currentConfig.armInward) * k;
+    this.currentConfig.shoulderForward += (targetShoulderForward - this.currentConfig.shoulderForward) * k;
   }
 
   private applyNaturalPose() {
     const humanoid = this.vrm.humanoid;
-    const c = this.config;
+    const c = this.currentConfig;
 
-    // 1. Upper Arms (Feminine slump forward + inward rotation)
+    // Apply offsets using the dynamic currentConfig
     this.applyOffset(humanoid, "leftUpperArm", c.shoulderForward, c.armInternalRotation, -c.shoulderDown);
     this.applyOffset(humanoid, "rightUpperArm", c.shoulderForward, -c.armInternalRotation, c.shoulderDown);
 
-    // 2. Lower Arms (Bring hands toward the front/stomach)
     this.applyOffset(humanoid, "leftLowerArm", -c.elbowBend, -c.armInward, 0);
     this.applyOffset(humanoid, "rightLowerArm", -c.elbowBend, c.armInward, 0);
 
-    // 3. Wrists (Soft inward tilt)
     this.applyOffset(humanoid, "leftHand", 0, 0.3, 0.15);
     this.applyOffset(humanoid, "rightHand", 0, -0.3, -0.15);
   }
