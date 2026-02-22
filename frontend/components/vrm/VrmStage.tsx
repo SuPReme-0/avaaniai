@@ -18,6 +18,10 @@ import { FaceController } from "@/features/body/FaceController";
 import { BodyController } from "@/features/body/BodyController";
 import { HandsController } from "@/features/body/HandsController";
 
+// ⚡ IMPORT THE NEW PHYSICS CONTROLLERS
+import { RootFixer } from "@/features/body/RootFixer";
+import { RotationController } from "@/features/body/RotationController";
+
 export interface VrmStageProps {
   modelUrl?: string;
   userId: string;
@@ -46,7 +50,7 @@ const VrmStage = forwardRef<unknown, VrmStageProps>(({
 
     const scene = createScene();
     
-    // 2. ENVIRONMENT & LIGHTING (Enhanced for VRM Materials)
+    // 2. ENVIRONMENT & LIGHTING 
     const pmremGenerator = new THREE.PMREMGenerator(renderer);
     scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
 
@@ -58,20 +62,35 @@ const VrmStage = forwardRef<unknown, VrmStageProps>(({
     const fillLight = new THREE.PointLight(0xaaccff, 0.8);
     fillLight.position.set(-2, 1, 1);
     scene.add(fillLight);
-
-    const clock = new THREE.Clock();
+const clock = new THREE.Clock();
+    
+    // ⚡ FIXED: Camera pulled back and lowered for a FULL BODY shot
     const camera = new THREE.PerspectiveCamera(30, canvas.clientWidth / canvas.clientHeight, 0.1, 20);
-    camera.position.set(0, 1.4, 1.8); // Closer portrait framing
+    camera.position.set(0, 0.9, 4.0); // Z=4.0 pulls the camera back
+    camera.lookAt(0, 0.8, 0);         // Look at her waist/center of gravity
 
     const avatarRoot = new THREE.Group();
     scene.add(avatarRoot);
 
+    // ⚡ NEW: Invisible Floor to catch dynamic shadows (The "Grounded" Illusion)
+    const floorGeometry = new THREE.PlaneGeometry(10, 10);
+    const floorMaterial = new THREE.ShadowMaterial({ opacity: 0.4 }); // Transparent, only shows shadows
+    const shadowFloor = new THREE.Mesh(floorGeometry, floorMaterial);
+    shadowFloor.rotation.x = -Math.PI / 2; // Lay it flat
+    shadowFloor.position.y = 0;            // Align with VRM feet
+    shadowFloor.receiveShadow = true;
+    scene.add(shadowFloor);
+
     let vrm: VRM | null = null;
+    
+    // ⚡ ADDED ROOT AND ROTATION CONTROLLERS TO THE REGISTRY
     const controllers = {
       live: null as LiveContextController | null,
       face: null as FaceController | null,
       body: null as BodyController | null,
       hands: null as HandsController | null,
+      root: null as RootFixer | null,
+      rotation: null as RotationController | null,
     };
 
     // 3. RESIZE LOGIC
@@ -100,59 +119,52 @@ const VrmStage = forwardRef<unknown, VrmStageProps>(({
 
         avatarRoot.add(vrm.scene);
 
-        // Init Controllers
+        // ⚡ INIT ALL CONTROLLERS 
         controllers.live = new LiveContextController(vrm);
         controllers.face = new FaceController(vrm, controllers.live);
         controllers.body = new BodyController(vrm, controllers.live);
         controllers.hands = new HandsController(vrm, controllers.live);
+        
+        // Root and Rotation handle her global position in the world
+        controllers.root = new RootFixer(vrm);
+        controllers.rotation = new RotationController(vrm, canvas);
 
         controllers.live.startVideo();
         onResize();
         
-        // Rotate root so character faces +Z (towards camera)
-        vrm.scene.rotation.y = Math.PI; 
+        // ⚡ REMOVED manual `vrm.scene.rotation.y = Math.PI;`
+        // We let the RootFixer/RotationController handle this exclusively now.
+
       } catch (e) {
         console.error("VRM Stage Error:", e);
       }
     })();
 
-// ──────────────────────────────────────────────────────────────────────────
+    // ──────────────────────────────────────────────────────────────────────────
     // 5. WEBSOCKET SUBSCRIPTION (Real-time Data)
     // ──────────────────────────────────────────────────────────────────────────
-    const unsubscribe = streamManager.subscribe((event: any) => { // Using 'any' temporarily to resolve the mismatch
+    const unsubscribe = streamManager.subscribe((event: any) => { 
       if (!controllers.live) return;
       
-      // Handle Eye/Vision Tracking Data
       if (event.type === "eyes_internal") {
         controllers.live.setContext(event.data);
       } 
-      
-      // Handle Audio Chunks (for Lip-sync and Emotions)
-      else if (event.type === "audio_chunk") {
+      // ⚡ UPDATED: We now listen to 'audio_metadata' from the optimized Python server
+      else if (event.type === "audio_metadata") {
         controllers.live.setContext({
           avatar_speaking: true,
-          // If 'volume' isn't in your event, we can calculate a fallback or 
-          // ensure your backend is actually sending it.
-          audio_volume: event.volume ?? 0.5, 
           emotion: event.emotion,
           emotion_probs: event.emotion_scores || { [event.emotion || "neutral"]: 1.0 }
         });
       }
-
-      // Handle the end of a response to stop mouth movement
-      // We check for 'response_end' which usually exists in your overlap list
       else if (event.type === "response_end" || event.type === "audio_end") {
-        controllers.live.setContext({ 
-          avatar_speaking: false, 
-          audio_volume: 0 
-        });
+        controllers.live.setContext({ avatar_speaking: false });
       }
-
-      // Handle System Status
       else if (event.type === "system") {
         controllers.live.setContext({ system_status: event.status });
       }
     });
+
     // 6. ANIMATION LOOP
     const animate = () => {
       if (!mounted) return;
@@ -160,7 +172,11 @@ const VrmStage = forwardRef<unknown, VrmStageProps>(({
       const dt = Math.min(clock.getDelta(), 0.1);
 
       if (vrm && controllers.live) {
+        // ⚡ UPDATE ALL PIPELINES IN ORDER
         controllers.live.update(dt);
+        controllers.rotation?.update(dt); // Handle mouse drags
+        controllers.root?.update();       // Lock position so she doesn't float away
+        
         controllers.face?.update(dt);
         controllers.body?.update(dt);
         controllers.hands?.update(dt);
@@ -184,8 +200,9 @@ const VrmStage = forwardRef<unknown, VrmStageProps>(({
   }, [modelUrl]);
 
   return (
-    <div className="w-full h-full relative bg-neutral-900">
-      <canvas ref={canvasRef} className="w-full h-full" />
+    <div className="w-full h-full relative bg-transparent">
+      {/* ⚡ Added cursor-grab to show she can be interacted with */}
+      <canvas ref={canvasRef} className="w-full h-full cursor-grab active:cursor-grabbing" />
     </div>
   );
 });
