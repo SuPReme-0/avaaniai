@@ -1,778 +1,302 @@
 // frontend/lib/vrm/streamManager.ts
 
-
-
 export type StreamEvent =
-
   | { type: 'status'; mode: string }
-
-  | { type: 'response_start'; text: string; emotion: string; emotion_scores?: Record<string, number>; user_name?: string }
-
-  | { type: 'audio_chunk'; payload: string; sample_rate: number; emotion: string; emotion_scores?: Record<string, number> }
-
-  | { type: 'eyes_internal'; data: any; emotion: string; emotion_scores?: Record<string, number> }
-
-  | { type: 'response_end'; emotion: string; emotion_scores?: Record<string, number> }
-
-  | { type: 'greet' }
-
-  | { type: 'config'; user_id: string; username: string }
-
-  | { type: 'video'; payload: string }
-
-  | { type: 'system'; status: string; user_name?: string; full_duplex?: boolean }
-
-  | { type: 'ping' | 'pong' }
-
+  | { type: 'response_start'; text: string; emotion: string; user_name?: string }
+  | { type: 'audio_metadata'; sample_rate: number; emotion: string; emotion_scores?: Record<string, number> }
+  | { type: 'eyes_internal'; data: any; emotion: string }
+  | { type: 'response_end'; emotion: string }
+  | { type: 'system'; status: string; user_name?: string }
   | { type: 'user_transcript'; text: string };
-
-
 
 type Listener = (event: StreamEvent) => void;
 
-
-
 class StreamManager {
-
   public ws: WebSocket | null = null;
-
-  private audioContext: AudioContext | null = null;
-
+  
+  // ⚡ DUAL AUDIO CONTEXTS (Zero Resampling Latency)
+  private playbackContext: AudioContext | null = null; // 24000 Hz for Kokoro
+  private micContext: AudioContext | null = null;      // 16000 Hz for Whisper
+  
   private analyser: AnalyserNode | null = null;
-
-  private audioQueue: { payload: string; sampleRate: number }[] = [];
-
- 
-
+  private audioQueue: { pcm: Int16Array; sampleRate: number; timestamp: number }[] = [];
+  
   private nextStartTime = 0;
-
   private listeners: Listener[] = [];
-
   private emotionState = { dominant: 'neutral', scores: {} as Record<string, number> };
-
+  
   private lastPong = Date.now();
-
   private mediaStream: MediaStream | null = null;
-
   private micWorkletNode: AudioWorkletNode | null = null;
-
   private isMicActive = false;
 
- 
-
   private userId = '';
-
   private username = '';
 
-
-
-  // Tuned for real‑time performance
-
-  private readonly SAMPLE_RATE = 16000;
-
-  private readonly HEARTBEAT_INTERVAL = 20000;
-
-  private readonly PONG_TIMEOUT = 45000;
-
+  private readonly MIC_SAMPLE_RATE = 16000;
+  private readonly PLAYBACK_SAMPLE_RATE = 24000;
+  private readonly HEARTBEAT_INTERVAL = 15000;
+  private readonly PONG_TIMEOUT = 30000;
+  
   private heartbeatInterval: NodeJS.Timeout | null = null;
-
-
-
-  // Reconnection
-
+  private reconnectTimer: NodeJS.Timeout | null = null;
   private reconnectAttempts = 0;
 
-  private readonly baseReconnectDelay = 1000;
-
-  private reconnectTimer: NodeJS.Timeout | null = null;
-
-
-
-  // Playback state
-
   private activeSourceCount = 0;
-
   private isScheduling = false;
-
-
-
-  // Callbacks
+  private currentSampleRate = 24000; // Updated by metadata packets
 
   public onMouthMove?: () => void;
-
   public onMouthStop?: () => void;
-
   public onEmotionUpdate?: (emotion: string, scores: Record<string, number>) => void;
 
-
-
-  // --------------------------------------------------------------------------
-
-  // CONNECTION MANAGEMENT
-
-  // --------------------------------------------------------------------------
-
-  // ⚡ Change: Added 'token?: string' parameter
-
   connect(userId: string, username: string, token?: string) {
-
     this.userId = userId;
-
     this.username = username;
 
-
-
     if (this.ws?.readyState === WebSocket.OPEN) return;
-
     this.cleanupConnection();
-
-
-
-    // ⚡ FIX 1: Safely construct the WS URL from the API URL
 
     const getWsUrl = () => {
-
       if (process.env.NEXT_PUBLIC_WS_URL) return process.env.NEXT_PUBLIC_WS_URL;
-
-     
-
       const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-
-      // Convert http:// to ws:// and https:// to wss://
-
-      const wsHost = apiUrl.replace(/^http/, 'ws');
-
-      return `${wsHost}/ws/avaani`;  
-
+      return `${apiUrl.replace(/^http/, 'ws')}/ws/avaani`;
     };
 
-
-
-    const url = getWsUrl();
-
-    this.ws = new WebSocket(url);
-
-    this.ws.binaryType = 'arraybuffer';
-
-
+    this.ws = new WebSocket(getWsUrl());
+    this.ws.binaryType = 'arraybuffer'; // ⚡ CRITICAL: Native Binary Routing
 
     this.ws.onopen = () => {
-
-      console.log('✅ WebSocket Connected');
-
+      console.log('✅ WebSocket Connected (Binary Mode)');
       this.reconnectAttempts = 0;
-
       this.lastPong = Date.now();
-
       this.startHeartbeat();
-
-     
-
-      // ⚡ Change: Send the token in the config packet
-
-      this.send({ type: "config", user_id: userId, username: username, token: token });
-
+      this.sendJSON({ type: "config", user_id: userId, username: username, token: token });
       this.notify({ type: 'status', mode: 'connected' });
 
-
-
-      if (!this.isMicActive) {
-
-        this.startMicrophone().catch(e => console.warn('Mic start failed:', e));
-
-      }
-
+      if (!this.isMicActive) this.startMicrophone();
     };
-
-
 
     this.ws.onmessage = (event) => {
+      // ⚡ FAST PATH: Instantly queue binary audio
+      if (event.data instanceof ArrayBuffer) {
+        const pcmData = new Int16Array(event.data);
+        this.queueAudio(pcmData, this.currentSampleRate);
+        return;
+      }
 
-      if (event.data instanceof ArrayBuffer) return; // Hook for future binary protocol
-
-
-
+      // SLOW PATH: JSON Metadata
       try {
-
         const packet = JSON.parse(event.data);
 
+        if (packet.type === 'ping') return this.sendJSON({ type: 'pong' });
+        if (packet.type === 'pong') { this.lastPong = Date.now(); return; }
 
-
-        if (packet.type === 'ping') {
-
-          this.send({ type: 'pong' });
-
-          return;
-
+        if (packet.type === 'audio_metadata') {
+          this.currentSampleRate = packet.sample_rate || 24000;
+          this.emotionState = { dominant: packet.emotion, scores: packet.emotion_scores || {} };
+          this.onEmotionUpdate?.(this.emotionState.dominant, this.emotionState.scores);
+          return; // Don't notify generic listeners for metadata
         }
-
-        if (packet.type === 'pong') {
-
-          this.lastPong = Date.now();
-
-          return;
-
-        }
-
-
 
         if ('emotion' in packet && packet.emotion) {
-
           this.emotionState = { dominant: packet.emotion, scores: packet.emotion_scores || {} };
-
           this.onEmotionUpdate?.(this.emotionState.dominant, this.emotionState.scores);
-
         }
-
-
-
-        if (packet.type === 'audio_chunk') {
-
-          this.queueAudio(packet.payload, packet.sample_rate);
-
-        }
-
-
 
         this.notify(packet as StreamEvent);
-
       } catch (e) {
-
-        console.error('❌ Stream parse error:', e);
-
+        console.error('❌ JSON parse error:', e);
       }
-
     };
-
-
 
     this.ws.onerror = (err) => console.error('❌ WebSocket Error:', err);
-
-    this.ws.onclose = (event) => {
-
-      console.log(`🔌 WebSocket Closed (code ${event.code})`);
-
+    this.ws.onclose = () => {
       this.cleanupConnection();
-
       this.notify({ type: 'status', mode: 'disconnected' });
-
       if (this.isMicActive) this.stopMicrophone();
 
-
-
-      const delay = Math.min(this.baseReconnectDelay * Math.pow(1.5, this.reconnectAttempts), 30000);
-
-      console.log(`🔄 Reconnecting in ${Math.round(delay)}ms (attempt ${this.reconnectAttempts + 1})`);
-
-
-
       this.reconnectTimer = setTimeout(() => {
-
         this.reconnectAttempts++;
-
         this.connect(this.userId, this.username);
-
-      }, delay);
-
+      }, Math.min(1000 * Math.pow(1.5, this.reconnectAttempts), 30000));
     };
-
   }
-
-
 
   private startHeartbeat() {
-
-    if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
-
     this.heartbeatInterval = setInterval(() => {
-
-      if (Date.now() - this.lastPong > this.PONG_TIMEOUT) {
-
-        console.warn('⚠️ Heartbeat timeout – forcing reconnect');
-
-        this.ws?.close();
-
-        return;
-
-      }
-
-      if (this.ws?.readyState === WebSocket.OPEN) {
-
-        this.send({ type: 'ping' });
-
-      }
-
+      if (Date.now() - this.lastPong > this.PONG_TIMEOUT) return this.ws?.close();
+      this.sendJSON({ type: 'ping' });
     }, this.HEARTBEAT_INTERVAL);
-
   }
 
-
-
-  send(data: any) {
-
+  sendJSON(data: any) {
     if (this.ws?.readyState === WebSocket.OPEN) {
-
       this.ws.send(JSON.stringify(data));
-
     }
-
   }
-
-
-
-  private cleanupConnection() {
-
-    if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
-
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-
-    this.heartbeatInterval = null;
-
-    this.reconnectTimer = null;
-
-   
-
-    if (this.ws) {
-
-      this.ws.onopen = null;
-
-      this.ws.onmessage = null;
-
-      this.ws.onerror = null;
-
-      this.ws.onclose = null;
-
-      if (this.ws.readyState === WebSocket.OPEN) this.ws.close();
-
-      this.ws = null;
-
-    }
-
-    this.audioQueue = [];
-
-    this.nextStartTime = 0;
-
-    this.activeSourceCount = 0;
-
-    this.isScheduling = false;
-
-  }
-
-
-
-  disconnect() {
-
-    this.cleanupConnection();
-
-    this.stopMicrophone();
-
-    this.notify({ type: 'status', mode: 'disconnected' });
-
-  }
-
-
 
   // --------------------------------------------------------------------------
-
-  // MICROPHONE STREAMING – AUDIO WORKLET (THREAD-SAFE)
-
+  // MICROPHONE (16kHz Dedicated)
   // --------------------------------------------------------------------------
-
-  private async initAudioContext() {
-
-    if (!this.audioContext) {
-
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-
-      this.audioContext = new AudioCtx({ sampleRate: this.SAMPLE_RATE, latencyHint: 'interactive' });
-
-      this.analyser = this.audioContext.createAnalyser();
-
-      this.analyser.fftSize = 256;
-
-      this.analyser.smoothingTimeConstant = 0.8;
-
-      this.analyser.connect(this.audioContext.destination);
-
-      console.log(`🎧 AudioContext: ${this.SAMPLE_RATE}Hz`);
-
-    }
-
-    if (this.audioContext.state === 'suspended') {
-
-      await this.audioContext.resume();
-
-    }
-
-  }
-
-
-
-  public async resumeAudioContext() {
-
-    await this.initAudioContext();
-
-  }
-
-
-
   public async startMicrophone() {
-
     if (this.isMicActive) return;
 
-    await this.initAudioContext();
-
-    if (!navigator.mediaDevices) throw new Error('MediaDevices unavailable');
-
-
+    if (!this.micContext) {
+      this.micContext = new (window.AudioContext || (window as any).webkitAudioContext)({
+        sampleRate: this.MIC_SAMPLE_RATE, latencyHint: 'interactive'
+      });
+    }
+    if (this.micContext.state === 'suspended') await this.micContext.resume();
 
     try {
-
-      const stream = await navigator.mediaDevices.getUserMedia({
-
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, sampleRate: this.SAMPLE_RATE, channelCount: 1 }
-
+      this.mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: { 
+          echoCancellation: true, noiseSuppression: true, autoGainControl: true, 
+          sampleRate: this.MIC_SAMPLE_RATE, channelCount: 1 
+        } as any
       });
-
-      this.mediaStream = stream;
-
       this.isMicActive = true;
 
-
-
-      const source = this.audioContext!.createMediaStreamSource(stream);
-
-      await this.initAudioWorklet(source);
-
-
-
-      console.log(`🎤 Mic Active & Streaming via AudioWorklet`);
-
-    } catch (e) {
-
-      console.error('❌ Mic Access Error:', e);
-
-      this.notify({ type: 'status', mode: 'mic_error' });
-
-      throw e;
-
-    }
-
-  }
-
-
-
-  private async initAudioWorklet(source: MediaStreamAudioSourceNode) {
-
-    // Inline AudioWorklet to avoid requiring an external static file
-
-    const workletCode = `
-
-      class MicProcessor extends AudioWorkletProcessor {
-
-        process(inputs, outputs, parameters) {
-
-          const input = inputs[0];
-
-          if (input.length > 0 && input[0].length > 0) {
-
-            const channelData = input[0];
-
-            const pcm16 = new Int16Array(channelData.length);
-
-            for (let i = 0; i < channelData.length; i++) {
-
-              const s = Math.max(-1, Math.min(1, channelData[i]));
-
-              pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-
+      const source = this.micContext.createMediaStreamSource(this.mediaStream);
+      
+      const workletCode = `
+        class MicProcessor extends AudioWorkletProcessor {
+          constructor() { super(); this.buffer = new Float32Array(960); this.idx = 0; }
+          process(inputs) {
+            const input = inputs[0];
+            if (!input || !input[0]) return true;
+            for (let i = 0; i < input[0].length; i++) {
+              this.buffer[this.idx++] = input[0][i];
+              if (this.idx >= this.buffer.length) {
+                const pcm16 = new Int16Array(this.buffer.length);
+                for (let j = 0; j < this.buffer.length; j++) {
+                  const s = Math.max(-1, Math.min(1, this.buffer[j]));
+                  pcm16[j] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                }
+                this.port.postMessage(pcm16.buffer, [pcm16.buffer]);
+                this.idx = 0;
+              }
             }
-
-            this.port.postMessage(pcm16.buffer, [pcm16.buffer]);
-
+            return true;
           }
-
-          return true;
-
         }
+        registerProcessor('mic-processor', MicProcessor);
+      `;
+      const blob = new Blob([workletCode], { type: 'application/javascript' });
+      await this.micContext.audioWorklet.addModule(URL.createObjectURL(blob));
+      
+      this.micWorkletNode = new AudioWorkletNode(this.micContext, 'mic-processor');
+      this.micWorkletNode.port.onmessage = (event) => {
+        // ⚡ INSTANT BINARY TRANSMISSION
+        if (this.ws?.readyState === WebSocket.OPEN) {
+          this.ws.send(event.data); 
+        }
+      };
 
-      }
-
-      registerProcessor('mic-processor', MicProcessor);
-
-    `;
-
-
-
-    const blob = new Blob([workletCode], { type: 'application/javascript' });
-
-    const workletUrl = URL.createObjectURL(blob);
-
-    await this.audioContext!.audioWorklet.addModule(workletUrl);
-
-   
-
-    this.micWorkletNode = new AudioWorkletNode(this.audioContext!, 'mic-processor');
-
-    this.micWorkletNode.port.onmessage = (event) => {
-
-      if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.isMicActive) return;
-
-     
-
-      const pcm16 = new Int16Array(event.data);
-
-      const bytes = new Uint8Array(pcm16.buffer);
-
-     
-
-      // Safe base64 conversion that won't stack overflow
-
-      let binary = '';
-
-      for (let i = 0; i < bytes.byteLength; i++) {
-
-        binary += String.fromCharCode(bytes[i]);
-
-      }
-
-      const base64 = btoa(binary);
-
-      this.send({ type: "audio", payload: base64 });
-
-    };
-
-
-
-    source.connect(this.micWorkletNode);
-
-    this.micWorkletNode.connect(this.audioContext!.destination);
-
+      source.connect(this.micWorkletNode);
+      this.micWorkletNode.connect(this.micContext.destination);
+    } catch (e) {
+      console.error('❌ Mic Error:', e);
+    }
   }
-
-
 
   public stopMicrophone() {
-
     if (!this.isMicActive) return;
-
-    if (this.mediaStream) {
-
-      this.mediaStream.getTracks().forEach(track => track.stop());
-
-      this.mediaStream = null;
-
-    }
-
-    if (this.micWorkletNode) {
-
-      this.micWorkletNode.disconnect();
-
-      this.micWorkletNode = null;
-
-    }
-
+    this.mediaStream?.getTracks().forEach(t => t.stop());
+    this.micWorkletNode?.disconnect();
     this.isMicActive = false;
-
-    console.log('🔇 Mic Stopped');
-
   }
 
-
-
   // --------------------------------------------------------------------------
-
-  // AUDIO PLAYBACK – GAPLESS JITTER BUFFER
-
+  // AUDIO PLAYBACK (24kHz Dedicated Kokoro)
   // --------------------------------------------------------------------------
+  private async initPlaybackContext() {
+    if (!this.playbackContext) {
+      this.playbackContext = new (window.AudioContext || (window as any).webkitAudioContext)({ 
+        sampleRate: this.PLAYBACK_SAMPLE_RATE, latencyHint: 'interactive' 
+      });
+      this.analyser = this.playbackContext.createAnalyser();
+      this.analyser.connect(this.playbackContext.destination);
+    }
+    if (this.playbackContext.state === 'suspended') await this.playbackContext.resume();
+  }
 
-  private queueAudio(base64Data: string, sampleRate: number) {
-
-    this.audioQueue.push({ payload: base64Data, sampleRate });
-
+  private queueAudio(pcm16: Int16Array, sampleRate: number) {
+    this.audioQueue.push({ pcm: pcm16, sampleRate, timestamp: performance.now() });
     this.schedulePlaybackQueue();
-
   }
-
-
 
   private async schedulePlaybackQueue() {
-
     if (this.isScheduling) return;
-
     this.isScheduling = true;
-
    
-
-    await this.initAudioContext();
-
-
+    await this.initPlaybackContext();
 
     while (this.audioQueue.length > 0) {
+      const { pcm, sampleRate } = this.audioQueue.shift()!;
+      
+      const float32 = new Float32Array(pcm.length);
+      for (let i = 0; i < pcm.length; i++) float32[i] = pcm[i] / 32768.0;
 
-      const { payload, sampleRate } = this.audioQueue.shift()!;
+      const audioBuffer = this.playbackContext!.createBuffer(1, float32.length, sampleRate);
+      audioBuffer.copyToChannel(float32, 0);
 
-      try {
+      const source = this.playbackContext!.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(this.analyser!);
 
-        const audioBuffer = this.decodePCM(payload, sampleRate);
+      if (this.activeSourceCount === 0) this.onMouthMove?.();
+      this.activeSourceCount++;
 
-        const source = this.audioContext!.createBufferSource();
+      const now = this.playbackContext!.currentTime;
+      if (this.nextStartTime < now) this.nextStartTime = now + 0.01;
 
-        source.buffer = audioBuffer;
+      source.start(this.nextStartTime);
+      this.nextStartTime += audioBuffer.duration;
 
-        source.connect(this.analyser!);
-
-
-
-        if (this.activeSourceCount === 0) this.onMouthMove?.();
-
-        this.activeSourceCount++;
-
-
-
-        const now = this.audioContext!.currentTime;
-
-       
-
-        // JITTER BUFFER: If we starved and nextStartTime is in the past, reset it slightly ahead
-
-        if (this.nextStartTime < now) {
-
-          this.nextStartTime = now + 0.05; // 50ms buffer to absorb minor network jitter
-
+      source.onended = () => {
+        this.activeSourceCount--;
+        if (this.activeSourceCount === 0 && this.audioQueue.length === 0) {
+          this.onMouthStop?.();
         }
-
-
-
-        source.start(this.nextStartTime);
-
-        this.nextStartTime += audioBuffer.duration;
-
-
-
-        source.onended = () => {
-
-          this.activeSourceCount--;
-
-          if (this.activeSourceCount === 0 && this.audioQueue.length === 0) {
-
-            this.onMouthStop?.();
-
-          }
-
-        };
-
-      } catch (e) {
-
-        console.error('❌ Playback error:', e);
-
-      }
-
+      };
     }
-
     this.isScheduling = false;
-
   }
 
-
-
-  private decodePCM(base64: string, sampleRate: number): AudioBuffer {
-
-    const binary = atob(base64);
-
-    const bytes = new Uint8Array(binary.length);
-
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-
-    const int16 = new Int16Array(bytes.buffer);
-
-    const float32 = new Float32Array(int16.length);
-
-    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768.0;
-
-   
-
-    const audioBuffer = this.audioContext!.createBuffer(1, float32.length, sampleRate);
-
-    audioBuffer.copyToChannel(float32, 0);
-
-    return audioBuffer;
-
+  private cleanupConnection() {
+    if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.ws) { this.ws.close(); this.ws = null; }
+    this.audioQueue = [];
+    this.nextStartTime = 0;
+    this.activeSourceCount = 0;
+    this.isScheduling = false;
   }
 
-
-
-  // --------------------------------------------------------------------------
-
-  // EVENT SYSTEM & UTILITIES
-
-  // --------------------------------------------------------------------------
+  disconnect() {
+    this.cleanupConnection();
+    this.stopMicrophone();
+  }
 
   subscribe(listener: Listener): () => void {
-
     this.listeners.push(listener);
-
-    return () => {
-
-      this.listeners = this.listeners.filter(l => l !== listener);
-
-    };
-
+    return () => { this.listeners = this.listeners.filter(l => l !== listener); };
   }
-
-
 
   private notify(event: StreamEvent) {
-
-    for (const listener of [...this.listeners]) {
-
-      try { listener(event); } catch (e) {
-
-        console.error('❌ Listener error:', e);
-
-      }
-
-    }
-
+    this.listeners.forEach(l => l(event));
   }
 
-
-
-  getEmotionState() {
-
-    return { ...this.emotionState };
-
-  }
-
-
+  getEmotionState() { return { ...this.emotionState }; }
 
   getCurrentVolume(): number {
-
     if (!this.analyser) return 0;
-
     const data = new Uint8Array(this.analyser.frequencyBinCount);
-
     this.analyser.getByteFrequencyData(data);
-
-    let sum = 0;
-
-    for (let i = 0; i < data.length; i++) sum += data[i];
-
-    return sum / data.length / 255;
-
+    return data.reduce((sum, val) => sum + val, 0) / data.length / 255;
   }
-
 }
-
-
 
 export const streamManager = new StreamManager();
-
-
-
-if (typeof window !== 'undefined') {
-
-  window.addEventListener('beforeunload', () => streamManager.disconnect());
-
-}
-

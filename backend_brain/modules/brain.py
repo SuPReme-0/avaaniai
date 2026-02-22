@@ -1,11 +1,10 @@
-# modules/brain.py
 import os
 import re
 import asyncio
 from groq import AsyncGroq
 from supabase import create_client, Client
 from dotenv import load_dotenv
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, AsyncGenerator
 
 load_dotenv()
 
@@ -137,32 +136,22 @@ Posture: {posture} | Gestures: {gestures} | Holding: {holding}
 [/PERIPHERAL SENSORY DATA]
 """
 
-    def _clean_response(self, text: str) -> str:
-        """Crucial for TTS: Strips markdown and emojis so the mouth speaks smoothly."""
-        text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
-        text = re.sub(r'\*(.*?)\*', r'\1', text)
-        text = re.sub(r'_(.*?)_', r'\1', text)
-        text = re.sub(r'\[(.*?)\]', r'\1', text)
-        text = re.sub(r'`(.*?)`', r'\1', text)
-        text = re.sub(r'^[\-\•\*]\s*', '', text, flags=re.MULTILINE)
-        
-        # Remove emojis and weird symbols
+    def _clean_token(self, text: str) -> str:
+        """Lightweight real-time cleaner for individual tokens."""
+        # Strip out common markdown symbols that might slip through
+        text = text.replace('*', '').replace('_', '').replace('`', '')
+        # Remove emojis
         text = re.sub(r'[^\w\s.,!?\'\-]', '', text)
-        
-        # Clean whitespace and enforce a hard cap just in case the LLM rambles
-        text = ' '.join(text.split())
-        if len(text) > 400:
-            text = text[:397] + "..."
-            
-        return text.strip()
+        return text
 
-    async def think(self, user_text: str, vision_context: Optional[Dict] = None) -> str:
-        """Main async generation pipeline."""
+    async def stream_think(self, user_text: str, vision_context: Optional[Dict] = None) -> AsyncGenerator[str, None]:
+        """⚡ INDUSTRY STANDARD: Main async generation pipeline yielding tokens in real-time."""
         if not self.client:
-            return "My connection is hazy right now, give me a sec."
+            yield "My connection is hazy right now, give me a sec."
+            return
 
         if not user_text.strip():
-            return ""
+            return
 
         # Update Short Term Memory
         self.short_term_memory.append({"role": "user", "content": user_text})
@@ -175,32 +164,44 @@ Posture: {posture} | Gestures: {gestures} | Holding: {holding}
 
         messages_payload = [{"role": "system", "content": final_system_prompt}] + self.short_term_memory
 
+        full_response = ""
+
         try:
-            # Groq API Call
-            completion = await self.client.chat.completions.create(
+            # ⚡ Groq API Call with stream=True
+            stream = await self.client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=messages_payload,
-                temperature=0.65,      # High enough for warmth, low enough to follow strict no-markdown rules
-                max_tokens=150,        # Keep it snappy
+                temperature=0.65,
+                max_tokens=150,
                 top_p=0.9,
-                frequency_penalty=0.3, # Prevents repetitive starting phrases 
-                presence_penalty=0.3
+                frequency_penalty=0.3, 
+                presence_penalty=0.3,
+                stream=True  # <--- This is the key to sub-second TTFB
             )
             
-            raw_response = completion.choices[0].message.content.strip()
-            clean_response = self._clean_response(raw_response)
+            async for chunk in stream:
+                token = chunk.choices[0].delta.content
+                if token:
+                    clean_token = self._clean_token(token)
+                    full_response += clean_token
+                    
+                    # Yield the cleaned token back to the server.py router instantly
+                    if clean_token:
+                        yield clean_token
+
+            # --- POST-GENERATION CLEANUP ---
+            final_clean_response = full_response.strip()
             
-            # Store in short term
-            self.short_term_memory.append({"role": "assistant", "content": clean_response})
-            
-            # Persist to DB asynchronously so it doesn't block the TTS return
-            if self.active_user_id:
-                asyncio.create_task(
-                    asyncio.to_thread(self._save_interaction_sync, self.active_user_id, user_text, clean_response)
-                )
-            
-            return clean_response
+            if final_clean_response:
+                # Store the complete sentence in short term memory
+                self.short_term_memory.append({"role": "assistant", "content": final_clean_response})
+                
+                # Persist to DB asynchronously so it doesn't block
+                if self.active_user_id:
+                    asyncio.create_task(
+                        asyncio.to_thread(self._save_interaction_sync, self.active_user_id, user_text, final_clean_response)
+                    )
 
         except Exception as e:
             print(f"🧠 Thinking Error: {e}")
-            return "Give me a second, I'm just catching my breath."
+            yield " Give me a second, I'm just catching my breath."

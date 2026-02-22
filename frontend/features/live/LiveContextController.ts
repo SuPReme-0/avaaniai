@@ -27,13 +27,14 @@ export type AvaaniLiveContext = {
   system_status?: string;
   is_speaking?: boolean;
   avatar_speaking?: boolean;
-  audio_volume?: number; // ⚡ ADDED
+  audio_volume?: number; 
   hands?: {
     left?: { landmarks?: Array<{ x: number; y: number; z: number }>; bbox?: number[]; handedness?: string; gesture?: string; };
     right?: { landmarks?: Array<{ x: number; y: number; z: number }>; bbox?: number[]; handedness?: string; gesture?: string; };
   };
 };
 
+// ⚡ FAST MATH OPTIMIZATION
 const smooth = (current: number, target: number, smoothTime: number, dt: number): number => {
   const omega = 2 / smoothTime;
   const x = omega * dt;
@@ -70,7 +71,7 @@ export class LiveContextController {
     idleWeight: 0.3, breathPhase: 0, breathDepth: 0.02, gestureWeight: 0,
     isUserSpeaking: false, isAvatarSpeaking: false,
     confidence: 0.8, energy: 0.6,
-    audioVolume: 0, // ⚡ ADDED - Store volume in state
+    audioVolume: 0, 
     leftHandLandmarks: null as Array<{ x: number; y: number; z: number }> | null,
     rightHandLandmarks: null as Array<{ x: number; y: number; z: number }> | null,
   };
@@ -82,7 +83,7 @@ export class LiveContextController {
   private ctx2D: CanvasRenderingContext2D | null = null;
   private isVideoActive = false;
   private lastVideoFrame = 0;
-  private readonly VIDEO_THROTTLE_MS = 66; 
+  private readonly VIDEO_THROTTLE_MS = 66; // ~15fps
 
   constructor(vrm: VRM) {
     this.vrm = vrm;
@@ -91,16 +92,15 @@ export class LiveContextController {
   public setContext(data: AvaaniLiveContext) {
     if (data.is_speaking !== undefined) this.state.isUserSpeaking = data.is_speaking;
     if (data.avatar_speaking !== undefined) this.state.isAvatarSpeaking = data.avatar_speaking;
-    if (data.audio_volume !== undefined) this.state.audioVolume = data.audio_volume; // ⚡ ADDED
+    if (data.audio_volume !== undefined) this.state.audioVolume = data.audio_volume; 
     this.ctx = { ...this.ctx, ...data };
   }
 
-  // ⚡ REMOVED redundant setters - use setContext instead for unified data flow
   public setAvatarSpeaking(speaking: boolean) { 
     this.state.isAvatarSpeaking = speaking;
     this.ctx.avatar_speaking = speaking;
   }
-  // Add this getter method
+  
   public getEngagement() { 
     return this.ctx.engagement ?? 0.5; 
   }
@@ -118,7 +118,13 @@ export class LiveContextController {
     this.state.confidence = smooth(this.state.confidence, rawConfidence, 0.3, delta);
 
     let totalWeight = 0, targetSpine = 0, targetShoulders = 0, targetHeadTilt = 0, targetEnergy = 0;
-    Object.keys(this.state.emotions).forEach(k => (this.state.emotions as any)[k] = 0);
+    
+    // ⚡ OPTIMIZATION: Direct assignment prevents GC overhead from Object.keys().forEach
+    this.state.emotions.happy = 0;
+    this.state.emotions.sad = 0;
+    this.state.emotions.angry = 0;
+    this.state.emotions.surprised = 0;
+    this.state.emotions.neutral = 0;
 
     for (const [emotion, weight] of Object.entries(probs)) {
       totalWeight += weight;
@@ -204,10 +210,7 @@ export class LiveContextController {
   public getPosture() { return { spineBend: this.state.spineBend, shoulderHeight: this.state.shoulderHeight, headPitch: this.state.headPitch, headYaw: this.state.headYaw, breathPhase: this.state.breathPhase, breathDepth: this.state.breathDepth, idleWeight: this.state.idleWeight, gestureWeight: this.state.gestureWeight }; }
   public getGaze() { return { x: this.state.gazeX, y: this.state.gazeY, visible: this.state.gazeVisible, headPitch: this.state.headPitch, headYaw: this.state.headYaw }; }
   public getSpeakingState() { return { isUserSpeaking: this.state.isUserSpeaking, isAvatarSpeaking: this.state.isAvatarSpeaking, confidence: this.state.confidence }; }
-  
-  // ⚡ UPDATED - Get volume from state (unified source)
   public getAudioVolume() { return this.state.audioVolume; }
-  
   public getEnergy() { return this.state.energy; }
   public getLeftHandLandmarks() { return this.state.leftHandLandmarks; }
   public getRightHandLandmarks() { return this.state.rightHandLandmarks; }
@@ -232,7 +235,9 @@ export class LiveContextController {
       this.ctx2D = this.canvas.getContext("2d", { willReadFrequently: true, alpha: false });
       if (!this.ctx2D) throw new Error("Canvas 2D unavailable");
 
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 15, max: 20 }, facingMode: "user" } });
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 15, max: 20 }, facingMode: "user" } 
+      });
       this.video.srcObject = stream;
       this.video.playsInline = true;
       this.video.muted = true;
@@ -240,7 +245,9 @@ export class LiveContextController {
 
       this.isVideoActive = true;
       requestAnimationFrame(this.processVideoFrame);
-    } catch (e) { console.error("👁️ Camera access error:", e); }
+    } catch (e) { 
+        console.error("👁️ Camera access error:", e); 
+    }
   }
 
   public stopVideo() {
@@ -254,14 +261,24 @@ export class LiveContextController {
 
   private processVideoFrame = () => {
     if (!this.isVideoActive || !this.video || !this.ctx2D || !this.canvas) return;
+    
     const now = performance.now();
+    
     if (now - this.lastVideoFrame > this.VIDEO_THROTTLE_MS && this.video.readyState === 4) {
       this.lastVideoFrame = now;
       this.ctx2D.drawImage(this.video, 0, 0, 320, 240);
-      const base64Url = this.canvas.toDataURL("image/jpeg", 0.6);
-      const base64Data = base64Url.split(",")[1];
-      if (base64Data) streamManager.send({ type: "video", payload: base64Data });
+      
+      // ⚡ OPTIMIZATION: Dropped quality to 0.5 (faster encode, smaller payload)
+      const base64Url = this.canvas.toDataURL("image/jpeg", 0.5); 
+      
+      // ⚡ OPTIMIZATION: "data:image/jpeg;base64," is exactly 23 chars. 
+      // substring() is vastly faster than split(',')[1] which creates array objects in memory.
+      const base64Data = base64Url.substring(23); 
+      
+      // ⚡ UPDATED: Uses the new sendJSON method from streamManager
+      if (base64Data) streamManager.sendJSON({ type: "video", payload: base64Data });
     }
+    
     requestAnimationFrame(this.processVideoFrame);
   };
 }

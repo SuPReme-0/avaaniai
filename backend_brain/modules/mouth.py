@@ -15,12 +15,12 @@ MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../mode
 MODEL_PATH = os.path.join(MODEL_DIR, "kokoro-v1.0.int8.onnx")
 VOICES_PATH = os.path.join(MODEL_DIR, "voices-v1.0.bin")
 
-SPEED = 1.40
+SPEED = 1.10
 SAMPLE_RATE = 24000
 
 class Mouth:
     def __init__(self, voice="af_bella", speed=SPEED):
-        print("👄 Initializing Avaani Mouth...")
+        print("👄 Initializing Avaani Mouth (CPU Optimized)...")
         self.voice = voice
         self.speed = speed
         self.kokoro = None
@@ -86,17 +86,13 @@ class Mouth:
 
     async def generate_stream(self, text):
         """
-        Yields small, strictly sized PCM chunks. 
-        This is critical for low-latency frontend playback and instant barge-in.
+        Yields small, strictly sized PCM chunks optimized for instant I/O loops.
         """
         if not text or self.kokoro is None:
             return
 
         clean_text = text.replace("Avaani", "Avni").replace("avaani", "avni")
         
-        # ⚡ OPTIMIZATION: Output Buffer
-        # 4096 bytes of 24kHz 16-bit audio = ~85 milliseconds per chunk.
-        # This is the sweet spot: fast enough for instant playback, large enough to avoid websocket overhead.
         CHUNK_SIZE = 4096 
         out_buffer = bytearray()
 
@@ -104,28 +100,27 @@ class Mouth:
             async for samples, _ in self.kokoro.create_stream(
                 clean_text, voice=self.voice, speed=self.speed, lang="en-us"
             ):
-                # Convert float32 [-1.0, 1.0] to int16 PCM bytes
+                # Convert float32 [-1.0, 1.0] to int16 PCM bytes rapidly
                 pcm_bytes = (samples * 32767.0).astype(np.int16).tobytes()
                 out_buffer.extend(pcm_bytes)
 
                 # Slice the buffer into strict chunks and yield
                 while len(out_buffer) >= CHUNK_SIZE:
                     chunk = bytes(out_buffer[:CHUNK_SIZE])
-                    del out_buffer[:CHUNK_SIZE]
+                    
+                    # ⚡ OPTIMIZATION: Reassign slice instead of using 'del' 
+                    out_buffer = out_buffer[CHUNK_SIZE:]
                     
                     yield chunk, SAMPLE_RATE
                     
-                    # 🛑 THE MAGIC SAUCE FOR BARGE-IN:
-                    # Yielding to the event loop allows `server.py` to check `interrupt_flag.is_set()`
-                    # If the user spoke, the server breaks the loop and this generator closes instantly.
-                    await asyncio.sleep(0.001)
+                    # ⚡ OPTIMIZATION: Instant yield to the event loop (0ms block)
+                    await asyncio.sleep(0)
 
             # Flush any remaining audio in the buffer after the model finishes
             if out_buffer:
                 yield bytes(out_buffer), SAMPLE_RATE
 
         except asyncio.CancelledError:
-            # Expected behavior when server.py kills the stream due to interruption
             pass
         except Exception as e:
             print(f"❌ TTS stream error: {e}")
