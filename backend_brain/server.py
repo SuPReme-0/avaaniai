@@ -1,14 +1,24 @@
-import uvicorn
 import os
+# ⚡ CRITICAL BUG FIX: These MUST be set before ANY other imports!
+# If numpy/torch load before this, they ignore it and thrash all 24 of your threads.
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
+os.environ["OPENBLAS_NUM_THREADS"] = "4"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "4"
+os.environ["NUMEXPR_NUM_THREADS"] = "4"
+
 import sys
 import json
 import base64
+import uvicorn
 import numpy as np
 import asyncio
 import time
 import signal
 import traceback
 import psutil
+import threading
+import re
 from typing import Dict, Any, Optional
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -18,7 +28,6 @@ from fastapi.responses import HTMLResponse
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 
-# ⚡ Speed Optimization: Use winloop if available
 try:
     import winloop
     winloop.install()
@@ -41,24 +50,24 @@ PORT = int(os.getenv("PORT", "8000"))
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "50"))
 HEARTBEAT_INTERVAL = 20  
 CONNECTION_TIMEOUT = 60  
+BARGE_IN_RMS_THRESHOLD = 0.04
 
-# Uncap the limits to use 100% of available logical cores
 CPU_CORES = psutil.cpu_count(logical=True) or 8
 
-# For I/O bound tasks (Network, Database)
+# ⚡ STRICT RESOURCE ISOLATION
 IO_POOL = ThreadPoolExecutor(max_workers=32, thread_name_prefix="io_worker")
+STT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stt_worker")
+TTS_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts_worker")
+VAD_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vad_worker")
+VISION_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="vision_worker")
 
-# For CPU/GPU bound tasks (Whisper, VAD, Vision)
-AUDIO_POOL = ThreadPoolExecutor(max_workers=CPU_CORES * 2, thread_name_prefix="audio_worker")
-CPU_POOL = ThreadPoolExecutor(max_workers=CPU_CORES, thread_name_prefix="cpu_worker")
 active_clients: Dict[str, Dict[str, Any]] = {}
-
-# Queue system for TTS 
 tts_queues: Dict[str, asyncio.Queue] = {}
-tts_workers: Dict[str, asyncio.Task] = {}
-
 system_logs = deque(maxlen=200)
 shutdown_event = asyncio.Event()
+
+# ⚡ BIOMETRIC RAM CACHE: Prevents redundant face vector loading
+vision_loaded_users = set()
 
 brain, vision, mouth, ears_module = None, None, None, None
 
@@ -67,7 +76,7 @@ brain, vision, mouth, ears_module = None, None, None, None
 # ==========================================
 def log(module: str, message: str, level: str = "INFO"):
     timestamp = time.strftime("%H:%M:%S")
-    icon = "ℹ️" if level == "INFO" else "⚠️" if level == "WARN" else "❌"
+    icon = "⏱️" if module == "LATENCY" else "ℹ️" if level == "INFO" else "⚠️" if level == "WARN" else "❌"
     entry = f"[{timestamp}] {icon} [{module}] {message}"
     print(entry)
     system_logs.append(entry)
@@ -75,10 +84,8 @@ def log(module: str, message: str, level: str = "INFO"):
 async def safe_send(websocket: WebSocket, message: dict):
     try:
         await asyncio.wait_for(websocket.send_json(message), timeout=0.5)
-    except (asyncio.TimeoutError, WebSocketDisconnect):
+    except Exception:
         pass
-    except Exception as e:
-        log("NET", f"Send Error: {e}", "WARN")
 
 # ==========================================
 # 3. LIFESPAN (Startup/Shutdown)
@@ -87,7 +94,7 @@ async def safe_send(websocket: WebSocket, message: dict):
 async def lifespan(app: FastAPI):
     global brain, vision, mouth, ears_module
     
-    log("CORE", "🚀 Booting Avaani Server...")
+    log("CORE", "🚀 Booting Avaani Server (Intel CPU Optimized)...")
     start_time = time.time()
 
     try:
@@ -97,21 +104,10 @@ async def lifespan(app: FastAPI):
         from modules.mouth import Mouth
         
         ears_module = ears_mod
-        
-        log("CORE", "Initializing AI Subsystems...")
         vision = VisionSystem()
         brain = BrainSystem()
         ears_module.init_models()
         mouth = Mouth()
-
-        if getattr(mouth, 'kokoro', None):
-            log("MOUTH", "🔥 Warming up TTS Engine...")
-            try:
-                async for _ in mouth.generate_stream("System ready."):
-                    pass
-                log("MOUTH", "✅ TTS Warmup Complete")
-            except Exception as e:
-                log("MOUTH", f"⚠️ TTS Warmup Warning: {e}", "WARN")
 
         log("CORE", f"✅ ALL SYSTEMS OPERATIONAL in {time.time() - start_time:.2f}s")
         yield
@@ -125,19 +121,16 @@ async def lifespan(app: FastAPI):
         log("CORE", "🛑 Shutting down...")
         shutdown_event.set()
         
-        # Shut down TTS workers
         for q in tts_queues.values():
             await q.put(None)
 
         for cid, client in active_clients.items():
-            try:
-                await client["websocket"].close(code=1001)
+            try: await client["websocket"].close()
             except: pass
             
         if vision and hasattr(vision, 'stop'): vision.stop()
-        CPU_POOL.shutdown(wait=False)
-        IO_POOL.shutdown(wait=False)
-        AUDIO_POOL.shutdown(wait=False)
+        for pool in [STT_POOL, TTS_POOL, VAD_POOL, IO_POOL, VISION_POOL]:
+            pool.shutdown(wait=False)
 
 app = FastAPI(lifespan=lifespan, title="Avaani Core")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -146,109 +139,10 @@ try:
     from modules.auth import router as auth_router, supabase
     app.include_router(auth_router)
 except ImportError:
-    log("AUTH", "⚠️ Auth module missing", "WARN")
-
-
-# ==========================================
-# 4. TTS QUEUE WORKER
-# ==========================================
-async def tts_worker_loop(client_id: str, websocket: WebSocket, ear_session: Any):
-    """Continuously processes queued TTS responses for a specific client."""
-    queue = tts_queues[client_id]
-    
-    while not shutdown_event.is_set():
-        data = await queue.get()
-        if data is None: 
-            break
-            
-        try:
-            response_text = data["text"]
-            start_emotion = data["emotion"]
-            user_name = data["user_name"]
-
-            await safe_send(websocket, {
-                "type": "response_start", "text": response_text, "emotion": start_emotion, "user_name": user_name
-            })
-
-            if mouth:
-                # ⚡ TURN DUCKING ON: Make ears less sensitive while bot speaks
-                if ear_session: ear_session.set_tts_state(True)
-
-                async for pcm, sample_rate in mouth.generate_stream(response_text):
-                    if shutdown_event.is_set() or client_id not in active_clients:
-                        break
-
-                    # ⚡ Send lightweight JSON metadata first
-                    current_emotion = vision.context.get("emotion", "neutral") if vision else "neutral"
-                    current_scores = vision.context.get("emotion_probs", {}) if vision else {}
-                    await safe_send(websocket, {
-                        "type": "audio_metadata", "sample_rate": sample_rate,
-                        "emotion": current_emotion, "emotion_scores": current_scores 
-                    })
-                    
-                    # ⚡ INSTANTLY follow up with RAW BINARY PCM (Zero Base64 Overhead)
-                    await websocket.send_bytes(pcm)
-                    
-                    await asyncio.sleep(0)
-                    
-        except Exception as e:
-            log("MOUTH", f"Queue Worker Error: {e}", "ERROR")
-        finally:
-            # ⚡ TURN DUCKING OFF: Bot stopped speaking
-            if ear_session:
-                ear_session.set_tts_state(False)
-
-            await safe_send(websocket, {"type": "response_end", "emotion": data.get("emotion", "neutral")})
-            await safe_send(websocket, {"type": "status", "mode": "listening"})
-            queue.task_done()
-
+    pass
 
 # ==========================================
-# 5. CORE LOGIC: CONVERSATION FLOW (OPTIMIZED)
-# ==========================================
-import re
-
-async def handle_conversation(websocket: WebSocket, client_id: str, user_text: str, vision_context: dict):
-    if not user_text.strip(): return
-    client = active_clients.get(client_id)
-    if not client: return
-
-    try:
-        await safe_send(websocket, {"type": "status", "mode": "thinking"})
-        
-        # ⚡ INDUSTRY STANDARD: Stream the LLM response instead of waiting for it
-        current_sentence = ""
-        
-        async for token in brain.stream_think(user_text, vision_context):
-            current_sentence += token
-            
-            # Check for sentence boundaries (., !, ?) to chunk for TTS
-            if re.search(r'[.!?]\s*$', current_sentence):
-                sentence_to_speak = current_sentence.strip()
-                current_sentence = "" # Reset for the next sentence
-                
-                if sentence_to_speak and client_id in tts_queues:
-                    log("BRAIN", f"Yielding to TTS: {sentence_to_speak}")
-                    await tts_queues[client_id].put({
-                        "text": sentence_to_speak,
-                        "emotion": vision_context.get("emotion", "neutral"),
-                        "user_name": client.get("full_name", "User")
-                    })
-
-        # Catch any leftover text that didn't end in punctuation
-        if current_sentence.strip() and client_id in tts_queues:
-            await tts_queues[client_id].put({
-                "text": current_sentence.strip(),
-                "emotion": vision_context.get("emotion", "neutral"),
-                "user_name": client.get("full_name", "User")
-            })
-            
-    except Exception as e:
-        log("ERR", f"Conversation Error: {e}", "ERROR")
-
-
-# ==========================================
-# 6. AUTHENTICATION HELPER
+# 4. AUTHENTICATION HELPER
 # ==========================================
 async def verify_token_and_get_user(token: str) -> Optional[str]:
     if not token: return None
@@ -259,17 +153,14 @@ async def verify_token_and_get_user(token: str) -> Optional[str]:
 
 async def fetch_user_profile(user_id: str) -> str:
     try:
-        for table in ["profiles", "users", "user_profiles"]:
-            res = await asyncio.get_running_loop().run_in_executor(IO_POOL, lambda t=table: supabase.table(t).select("full_name, username").eq("id", user_id).execute())
-            if res.data:
-                u = res.data[0]
-                return u.get("full_name") or u.get("username") or "User"
+        res = await asyncio.get_running_loop().run_in_executor(IO_POOL, lambda: supabase.table("profiles").select("full_name, username").eq("id", user_id).execute())
+        if res.data:
+            return res.data[0].get("full_name") or res.data[0].get("username") or "User"
     except: pass
     return "User"
 
-
 # ==========================================
-# 7. WEBSOCKET CONTROLLER
+# 5. WEBSOCKET CONTROLLER
 # ==========================================
 @app.websocket("/ws/avaani")
 async def websocket_endpoint(websocket: WebSocket):
@@ -280,161 +171,290 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close(code=1013, reason="Server at capacity")
         return
 
+    # ⚡ THREAD-SAFE STATE
     client_state = {
         "websocket": websocket, "id": client_id, "last_heartbeat": time.time(),
-        "authenticated": False, "user_id": None, "full_name": "Guest", "audio_buffer": bytearray()  
+        "authenticated": False, "user_id": None, "full_name": "Guest", 
+        "audio_buffer": bytearray(), 
+        "interrupt_event": threading.Event(), # Matches mouth.py exactly
+        "tts_active": False,
+        "current_pipeline_task": None,
+        "tasks": set()
     }
     
     active_clients[client_id] = client_state
-    
-    # ⚡ Initialize EarSession BEFORE the TTS Worker
     ear_session = ears_module.EarSession() if ears_module else None
-
-    # ⚡ Initialize Client's TTS Queue and Worker
     tts_queues[client_id] = asyncio.Queue()
-    tts_workers[client_id] = asyncio.create_task(tts_worker_loop(client_id, websocket, ear_session))
     
     log("NET", f"🔌 Client Connected: {client_id[:8]}")
+
+    # ==========================================
+    # WORKER 1: TTS QUEUE CONSUMER
+    # ==========================================
+    async def tts_worker_loop():
+        queue = tts_queues[client_id]
+        
+        while not shutdown_event.is_set():
+            data = await queue.get()
+            if data is None: break 
+            
+            if client_state["interrupt_event"].is_set():
+                queue.task_done()
+                continue
+                
+            try:
+                response_text = data["text"]
+                start_emotion = data["emotion"]
+                t_pipeline_start = data["t_pipeline_start"]
+
+                await safe_send(websocket, {
+                    "type": "response_start", "text": response_text, "emotion": start_emotion, "user_name": client_state["full_name"]
+                })
+
+                if mouth:
+                    client_state["tts_active"] = True
+                    if ear_session: ear_session.set_tts_state(True)
+                    
+                    tts_start_time = time.time()
+                    first_byte_emitted = False
+
+                    # Pass threading.Event to cleanly abort generation on barge-in
+                    async for pcm, sample_rate in mouth.generate_stream(response_text, client_state["interrupt_event"]):
+                        if shutdown_event.is_set() or client_state["interrupt_event"].is_set():
+                            break
+
+                        if not first_byte_emitted:
+                            first_byte_emitted = True
+                            tts_latency = time.time() - tts_start_time
+                            total_latency = time.time() - t_pipeline_start
+                            log("LATENCY", f"TTS Compute: {tts_latency:.2f}s | TOTAL SYSTEM LATENCY: {total_latency:.2f}s")
+
+                        b64_audio = base64.b64encode(pcm).decode('utf-8')
+                        current_emotion = vision.context.get("emotion", "neutral") if vision else "neutral"
+                        current_scores = vision.context.get("emotion_probs", {}) if vision else {}
+                        
+                        await safe_send(websocket, {
+                            "type": "audio_chunk", "payload": b64_audio, "sample_rate": sample_rate,
+                            "emotion": current_emotion, "emotion_scores": current_scores 
+                        })
+                        await asyncio.sleep(0)
+                        
+            except Exception as e:
+                log("MOUTH", f"Queue Worker Error: {e}", "ERROR")
+            finally:
+                client_state["tts_active"] = False
+                if ear_session: ear_session.set_tts_state(False)
+
+                if not client_state["interrupt_event"].is_set():
+                    await safe_send(websocket, {"type": "response_end", "emotion": data.get("emotion", "neutral")})
+                    if queue.empty():
+                        await safe_send(websocket, {"type": "status", "mode": "listening"})
+                queue.task_done()
+
+    # ==========================================
+    # WORKER 2: THE AI PIPELINE (STT -> LLM)
+    # ==========================================
+    async def run_conversational_pipeline(audio_data: np.ndarray, context: dict):
+        try:
+            t_pipeline_start = time.time()
+            
+            # 1. ASYNC STT 
+            transcript = await asyncio.get_running_loop().run_in_executor(STT_POOL, ear_session.transcribe, audio_data)
+            t_stt_end = time.time()
+            
+            if not transcript or client_state["interrupt_event"].is_set(): return
+            
+            log("EARS", f"Heard: {transcript}")
+            log("LATENCY", f"STT Time: {t_stt_end - t_pipeline_start:.2f}s")
+            
+            await safe_send(websocket, {"type": "user_transcript", "text": transcript})
+            await safe_send(websocket, {"type": "status", "mode": "thinking"})
+            
+            # 2. LLM STREAMING
+            current_sentence = ""
+            first_token_time = None
+            
+            async for token in brain.stream_think(transcript, context, is_interruption=client_state["interrupt_event"].is_set()):
+                if client_state["interrupt_event"].is_set(): break
+                
+                if first_token_time is None:
+                    first_token_time = time.time()
+                    log("LATENCY", f"LLM First Token: {first_token_time - t_stt_end:.2f}s")
+                    
+                current_sentence += token
+                
+                # CHUNK BY SENTENCE (Passes cleanly to Kokoro)
+                if re.search(r'[.!?]\s*$', current_sentence):
+                    sentence_to_speak = current_sentence.strip()
+                    current_sentence = "" 
+                    
+                    if sentence_to_speak:
+                        log("BRAIN", f"Yielding: {sentence_to_speak}")
+                        await tts_queues[client_id].put({
+                            "text": sentence_to_speak,
+                            "emotion": context.get("emotion", "neutral"),
+                            "user_name": client_state["full_name"],
+                            "t_pipeline_start": t_pipeline_start
+                        })
+
+            # Catch leftovers
+            if current_sentence.strip() and not client_state["interrupt_event"].is_set():
+                await tts_queues[client_id].put({
+                    "text": current_sentence.strip(),
+                    "emotion": context.get("emotion", "neutral"),
+                    "user_name": client_state["full_name"],
+                    "t_pipeline_start": t_pipeline_start
+                })
+                
+        except Exception as e:
+            log("ERR", f"Pipeline Error: {e}", "ERROR")
+
+    # ==========================================
+    # WORKER 3: VAD FAST-LANE
+    # ==========================================
+    async def process_vad(chunk: np.ndarray):
+        loop = asyncio.get_running_loop()
+        
+        process_chunk = True
+        if client_state["tts_active"]:
+            rms = np.sqrt(np.mean(chunk**2))
+            if rms < BARGE_IN_RMS_THRESHOLD:
+                process_chunk = False
+                if hasattr(ear_session, 'reset_vad'): ear_session.reset_vad()
+
+        if process_chunk:
+            utterance_audio = await loop.run_in_executor(VAD_POOL, ear_session.process_chunk, chunk)
+
+            if getattr(ear_session, 'status', None) == "receiving_speech" and client_state["tts_active"]:
+                if not client_state["interrupt_event"].is_set():
+                    log("EARS", "🛑 User interrupted! Halting current thoughts...")
+                    client_state["interrupt_event"].set()
+                    await safe_send(websocket, {"type": "status", "mode": "interrupted"})
+                    
+                    while not tts_queues[client_id].empty():
+                        try: tts_queues[client_id].get_nowait()
+                        except: pass
+
+            if utterance_audio is not None:
+                client_state["interrupt_event"].clear() 
+                
+                if client_state["current_pipeline_task"] and not client_state["current_pipeline_task"].done():
+                    client_state["current_pipeline_task"].cancel()
+                    
+                ctx = vision.get_context_json() if vision else {}
+                client_state["current_pipeline_task"] = asyncio.create_task(
+                    run_conversational_pipeline(utterance_audio, ctx)
+                )
 
     async def heartbeat_monitor():
         while client_id in active_clients and not shutdown_event.is_set():
             await asyncio.sleep(HEARTBEAT_INTERVAL)
             if time.time() - client_state["last_heartbeat"] > CONNECTION_TIMEOUT:
-                log("NET", f"💔 Client {client_id[:8]} timed out.")
-                await websocket.close(code=1000)
                 break
             await safe_send(websocket, {"type": "ping"})
 
-    heartbeat_task = asyncio.create_task(heartbeat_monitor())
+    client_state["tasks"].update([
+        asyncio.create_task(tts_worker_loop()),
+        asyncio.create_task(heartbeat_monitor())
+    ])
 
+    # ==========================================
+    # MAIN RECEIVE LOOP
+    # ==========================================
     try:
         while not shutdown_event.is_set():
-            # ⚡ Receive raw websocket payload (Detects text vs bytes automatically)
             message = await websocket.receive()
             client_state["last_heartbeat"] = time.time()
+            
+            if message.get("type") == "websocket.disconnect":
+                break
 
-            # ----------------------------------------------------------------
-            # FAST PATH: BINARY MICROPHONE DATA
-            # ----------------------------------------------------------------
-            if "bytes" in message:
+            if "bytes" in message and message["bytes"]:
                 if not ears_module: continue
-                raw_bytes = message["bytes"]
-                client_state["audio_buffer"].extend(raw_bytes)
-                CHUNK_BYTES = 1024 
+                client_state["audio_buffer"].extend(message["bytes"])
                 
-                while len(client_state["audio_buffer"]) >= CHUNK_BYTES:
-                    chunk_bytes = bytes(client_state["audio_buffer"][:CHUNK_BYTES])
-                    client_state["audio_buffer"] = client_state["audio_buffer"][CHUNK_BYTES:]
-                    
+                while len(client_state["audio_buffer"]) >= 1024:
+                    chunk_bytes = bytes(client_state["audio_buffer"][:1024])
+                    del client_state["audio_buffer"][:1024]
                     chunk = np.frombuffer(chunk_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-                    
-                    # 1. FAST VAD ONLY 
-                    utterance_audio = await asyncio.get_running_loop().run_in_executor(
-                        CPU_POOL, ear_session.process_chunk, chunk
-                    )
+                    asyncio.create_task(process_vad(chunk))
 
-                    # 2. ASYNC WHISPER 
-                    if utterance_audio is not None:
-                        ctx = vision.get_context_json() if vision else {}
-                        
-                        async def async_transcribe_and_reply(data, context):
-                            transcript = await asyncio.get_running_loop().run_in_executor(
-                                AUDIO_POOL, ear_session.transcribe, data
-                            )
-                            if transcript:
-                                log("EARS", f"Heard: {transcript}")
-                                await safe_send(websocket, {"type": "user_transcript", "text": transcript})
-                                await handle_conversation(websocket, client_id, transcript, context)
-                        
-                        asyncio.create_task(async_transcribe_and_reply(utterance_audio, ctx))
-
-            # ----------------------------------------------------------------
-            # SLOW PATH: JSON TEXT DATA (Commands, Video, Config)
-            # ----------------------------------------------------------------
-            elif "text" in message:
+            elif "text" in message and message["text"]:
                 try:
                     data = json.loads(message["text"])
-                except Exception:
-                    continue
-                    
-                packet_type = data.get("type")
-                payload = data.get("payload")
+                    packet_type = data.get("type")
+                    payload = data.get("payload")
 
-                if packet_type == "config":
-                    token = data.get("token") or data.get("access_token")
-                    user_id = await verify_token_and_get_user(token)
-                    
-                    if user_id:
-                        client_state.update({"authenticated": True, "user_id": user_id})
-                        full_name = await fetch_user_profile(user_id)
-                        client_state["full_name"] = full_name
+                    if packet_type == "config":
+                        token = data.get("token") or data.get("access_token")
+                        user_id = await verify_token_and_get_user(token)
                         
-                        if brain: asyncio.create_task(asyncio.to_thread(brain.load_memory, user_id))
-                        if vision: asyncio.create_task(asyncio.to_thread(vision.load_user_into_memory, supabase, user_id, data.get("username", "User")))
+                        if user_id:
+                            client_state.update({"authenticated": True, "user_id": user_id})
+                            full_name = await fetch_user_profile(user_id)
+                            client_state["full_name"] = full_name
+                            
+                            # ⚡ BIOMETRIC LOAD GUARD
+                            if user_id not in vision_loaded_users and user_id.lower() != "guest":
+                                log("AUTH", f"Downloading biometrics for new session: {full_name}")
+                                loop = asyncio.get_running_loop()
+                                if brain: asyncio.create_task(asyncio.to_thread(brain.load_memory, user_id))
+                                if vision: asyncio.create_task(asyncio.to_thread(vision.load_user_into_memory, supabase, user_id, full_name))
+                                vision_loaded_users.add(user_id)
+                            else:
+                                log("AUTH", f"Biometrics already in RAM for {full_name}. Skipping download.")
 
-                        log("AUTH", f"✅ Authenticated: {full_name}")
-                        await safe_send(websocket, {"type": "system", "status": "ready", "user_name": full_name})
-                    else:
-                        await safe_send(websocket, {"type": "error", "message": "Auth Failed"})
+                            log("AUTH", f"✅ Authenticated: {full_name}")
+                            await safe_send(websocket, {"type": "system", "status": "ready", "user_name": full_name})
+                            
+                    elif packet_type == "video" and payload and cv2:
+                        loop = asyncio.get_running_loop()
+                        def process_frame_task(b64_data):
+                            try:
+                                nparr = np.frombuffer(base64.b64decode(b64_data), np.uint8)
+                                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                                if frame is not None and vision: 
+                                    vision.process_frame(frame)
+                                    ctx = vision.get_context_json()
+                                    asyncio.run_coroutine_threadsafe(safe_send(websocket, {"type": "eyes_internal", "data": ctx}), loop)
+                            except: pass
+                        VISION_POOL.submit(process_frame_task, payload)
 
-                elif packet_type == "video" and payload and cv2:
-                    loop = asyncio.get_running_loop()
-                    def process_frame_task(b64_data):
-                        try:
-                            nparr = np.frombuffer(base64.b64decode(b64_data), np.uint8)
-                            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                            if frame is not None and vision: 
-                                vision.process_frame(frame)
-                                ctx = vision.get_context_json()
-                                asyncio.run_coroutine_threadsafe(
-                                    safe_send(websocket, {"type": "eyes_internal", "data": ctx}), loop
-                                )
-                        except Exception as e: 
-                            log("VISION", f"Frame task error: {e}", "WARN")
-                    CPU_POOL.submit(process_frame_task, payload)
+                    elif packet_type == "ping":
+                        await safe_send(websocket, {"type": "pong"})
 
-                elif packet_type == "ping":
-                    await safe_send(websocket, {"type": "pong"})
+                except json.JSONDecodeError: pass
 
     except WebSocketDisconnect:
         pass
     except Exception as e:
         log("NET", f"WS Error {client_id[:8]}: {e}", "ERROR")
     finally:
-        heartbeat_task.cancel()
+        client_state["interrupt_event"].set()
         
-        # Clean up Queues and Workers
-        if client_id in tts_queues:
-            await tts_queues[client_id].put(None)  # Signal worker to shutdown
-            del tts_queues[client_id]
-        if client_id in tts_workers:
-            tts_workers[client_id].cancel()
-            del tts_workers[client_id]
+        for task in client_state["tasks"]:
+            task.cancel()
+        if client_state["current_pipeline_task"]:
+            client_state["current_pipeline_task"].cancel()
             
-        if client_id in active_clients: del active_clients[client_id]
+        if client_id in tts_queues:
+            await tts_queues[client_id].put(None)
+            del tts_queues[client_id]
+            
+        if client_id in active_clients: 
+            del active_clients[client_id]
+            
+        try: await websocket.close()
+        except: pass
         log("NET", f"🔌 Client Disconnected: {client_id[:8]}")
 
-
-# ==========================================
-# 8. ADMIN DASHBOARD
-# ==========================================
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    return f"""
-    <!DOCTYPE html><html><head><title>Avaani Core Status</title><meta http-equiv="refresh" content="3">
-    <style>body {{ background: #1a1a2e; color: #fff; font-family: monospace; padding: 20px; }}
-    .card {{ background: #16213e; padding: 20px; margin-bottom: 20px; border-radius: 8px; border-left: 5px solid #0f3460; }}
-    .log-box {{ background: #000; padding: 10px; height: 400px; overflow-y: scroll; border: 1px solid #333; }}
-    </style></head><body><h1>🟢 AVAANI SERVER STATUS</h1>
-    <div class="card"><h3>Active Connections: {len(active_clients)} / {MAX_CLIENTS}</h3>
-    <p>CPU: {psutil.cpu_percent()}% | RAM: {psutil.virtual_memory().percent}%</p></div>
-    <div class="log-box">{'<br>'.join(list(system_logs)[-50:])}</div></body></html>
-    """
+    return "<h1>🟢 AVAANI SERVER STATUS</h1>"
 
 if __name__ == "__main__":
     os.makedirs("logs", exist_ok=True)
     signal.signal(signal.SIGINT, lambda s, f: shutdown_event.set())
     signal.signal(signal.SIGTERM, lambda s, f: shutdown_event.set())
-
     log("BOOT", f"🚀 Starting Server on {HOST}:{PORT}")
     uvicorn.run("server:app", host=HOST, port=PORT, log_level="warning", reload=False)

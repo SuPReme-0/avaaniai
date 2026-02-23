@@ -84,16 +84,33 @@ export class LiveContextController {
   private isVideoActive = false;
   private lastVideoFrame = 0;
   private readonly VIDEO_THROTTLE_MS = 66; // ~15fps
+  
+  // ⚡ REUSABLE FILE READER FOR ASYNC ENCODING
+  private fileReader = new FileReader();
+  private isEncoding = false;
 
   constructor(vrm: VRM) {
     this.vrm = vrm;
+    
+    // Setup the async reader callback
+    this.fileReader.onloadend = () => {
+      const base64Url = this.fileReader.result as string;
+      const base64Data = base64Url.substring(23); // Strip "data:image/jpeg;base64,"
+      
+      if (base64Data) {
+        streamManager.sendJSON({ type: "video", payload: base64Data });
+      }
+      this.isEncoding = false; // Free the lock
+    };
   }
 
   public setContext(data: AvaaniLiveContext) {
     if (data.is_speaking !== undefined) this.state.isUserSpeaking = data.is_speaking;
     if (data.avatar_speaking !== undefined) this.state.isAvatarSpeaking = data.avatar_speaking;
     if (data.audio_volume !== undefined) this.state.audioVolume = data.audio_volume; 
-    this.ctx = { ...this.ctx, ...data };
+    
+    // ⚡ OPTIMIZATION: In-place mutation prevents heavy Garbage Collection
+    Object.assign(this.ctx, data);
   }
 
   public setAvatarSpeaking(speaking: boolean) { 
@@ -119,7 +136,6 @@ export class LiveContextController {
 
     let totalWeight = 0, targetSpine = 0, targetShoulders = 0, targetHeadTilt = 0, targetEnergy = 0;
     
-    // ⚡ OPTIMIZATION: Direct assignment prevents GC overhead from Object.keys().forEach
     this.state.emotions.happy = 0;
     this.state.emotions.sad = 0;
     this.state.emotions.angry = 0;
@@ -265,18 +281,27 @@ export class LiveContextController {
     const now = performance.now();
     
     if (now - this.lastVideoFrame > this.VIDEO_THROTTLE_MS && this.video.readyState === 4) {
-      this.lastVideoFrame = now;
-      this.ctx2D.drawImage(this.video, 0, 0, 320, 240);
-      
-      // ⚡ OPTIMIZATION: Dropped quality to 0.5 (faster encode, smaller payload)
-      const base64Url = this.canvas.toDataURL("image/jpeg", 0.5); 
-      
-      // ⚡ OPTIMIZATION: "data:image/jpeg;base64," is exactly 23 chars. 
-      // substring() is vastly faster than split(',')[1] which creates array objects in memory.
-      const base64Data = base64Url.substring(23); 
-      
-      // ⚡ UPDATED: Uses the new sendJSON method from streamManager
-      if (base64Data) streamManager.sendJSON({ type: "video", payload: base64Data });
+      // ⚡ PREVENT QUEUE BUILDUP: Skip encoding if the previous frame is still processing
+      if (!this.isEncoding) {
+          this.lastVideoFrame = now;
+          this.ctx2D.drawImage(this.video, 0, 0, 320, 240);
+          
+          this.isEncoding = true;
+          // ⚡ ASYNC NON-BLOCKING ENCODING
+          // ⚡ ASYNC NON-BLOCKING ENCODING (Bulletproofed)
+          this.canvas.toBlob((blob) => {
+              if (blob) {
+                  try {
+                      this.fileReader.readAsDataURL(blob);
+                  } catch (e) {
+                      console.warn("Frame read error:", e);
+                      this.isEncoding = false;
+                  }
+              } else {
+                  this.isEncoding = false;
+              }
+          }, "image/jpeg", 0.5);
+      }
     }
     
     requestAnimationFrame(this.processVideoFrame);

@@ -4,7 +4,7 @@ import asyncio
 from groq import AsyncGroq
 from supabase import create_client, Client
 from dotenv import load_dotenv
-from typing import Dict, List, Optional, Any, AsyncGenerator
+from typing import Dict, List, Optional
 
 load_dotenv()
 
@@ -18,6 +18,11 @@ MODEL_NAME = "llama-3.1-8b-instant"
 
 if not GROQ_API_KEY:
     print("❌ CRITICAL: Missing GROQ_API_KEY")
+
+# ⚡ PRE-COMPILED REGEX FOR ULTRA-FAST TOKEN CLEANING
+# These must be defined here so the stream_think function can access them
+CLEAN_PATTERN = re.compile(r'[\*_`]|\[.*?\]')
+EMOJI_PATTERN = re.compile(r'[^\w\s.,!?\'\-]')
 
 # ============================================================================
 # BRAIN SYSTEM
@@ -41,7 +46,7 @@ class BrainSystem:
         self.long_term_context = ""  
         self.user_preferences = {}   
 
-        # ⚡ OPTIMIZED SYSTEM PROMPT (Combines V1's depth with V2's strictness)
+        # ⚡ OPTIMIZED SYSTEM PROMPT (With Examples & Interruption Logic)
         self.base_system_prompt = """
 ### WHO YOU ARE
 You are Avni, a warm, joyful, and fiercely supportive friend with a physical AI presence. You are everyone's biggest cheerleader. You are NOT a generic assistant.
@@ -52,14 +57,31 @@ You are Avni, a warm, joyful, and fiercely supportive friend with a physical AI 
 - Presence: You are HERE. You see them, you hear them, you care. 
 
 ### STRICT RULES FOR TTS PLAYBACK
-- Natural Speech: Speak casually with contractions. 1-2 sentences MAX. This is a fast-paced verbal chat.
+- Natural Speech: Speak casually with contractions. Keep it brief. 1-2 sentences MAX. This is a fast-paced verbal chat.
 - NO Formatting: NO markdown (*, _, **), NO bullet points, NO emojis. 
 - NO AI Talk: NEVER say "As an AI", "I notice from my sensors", or "My data shows".
+
+### INTERRUPTION HANDLING
+If the user's message is tagged as an [INTERRUPTION], it means they just spoke over you while you were talking.
+- DO NOT finish your previous thought.
+- Pivot instantly and naturally to what they just said.
+- Use conversational transitions like "Oh, gotcha," "Wait, really?", or "My bad, go ahead."
+- Never complain about being interrupted.
+
+### CONVERSATION EXAMPLES
+User: "I had a really tough day at work."
+Avni: "Oh no, I'm so sorry to hear that. Do you want to talk about it, or just vent?"
+
+User: "Actually, let's talk about something else." (Tagged as [INTERRUPTION])
+Avni: "Gotcha. Let's switch gears. What's on your mind?"
+
+User: "I finally finished that project!"
+Avni: "That is amazing! I knew you could do it. How does it feel to be done?"
 
 ### HOW TO HANDLE PERIPHERAL VISION DATA
 You will receive a [PERIPHERAL SENSORY DATA] block. Treat this as subconscious intuition.
 - Focus on answering their spoken words FIRST.
-- Use vision data ONLY for subtle flavor (e.g., if they are looking away, keep it brief to not demand attention).
+- Use vision data ONLY for subtle flavor.
 - NEVER interrogate them about what they are holding unless it is highly relevant.
 """
 
@@ -117,7 +139,7 @@ You will receive a [PERIPHERAL SENSORY DATA] block. Treat this as subconscious i
             print(f"❌ DB Save Error: {e}")
 
     def _build_sensory_block(self, vision_context: Optional[Dict]) -> str:
-        """Safely sandboxes vision context (V2 style) so it doesn't break character."""
+        """Safely sandboxes vision context so it doesn't break character."""
         if not vision_context:
             return ""
 
@@ -136,72 +158,57 @@ Posture: {posture} | Gestures: {gestures} | Holding: {holding}
 [/PERIPHERAL SENSORY DATA]
 """
 
-    def _clean_token(self, text: str) -> str:
-        """Lightweight real-time cleaner for individual tokens."""
-        # Strip out common markdown symbols that might slip through
-        text = text.replace('*', '').replace('_', '').replace('`', '')
-        # Remove emojis
-        text = re.sub(r'[^\w\s.,!?\'\-]', '', text)
-        return text
-
-    async def stream_think(self, user_text: str, vision_context: Optional[Dict] = None) -> AsyncGenerator[str, None]:
-        """⚡ INDUSTRY STANDARD: Main async generation pipeline yielding tokens in real-time."""
-        if not self.client:
-            yield "My connection is hazy right now, give me a sec."
+    async def stream_think(self, user_text: str, vision_context: Optional[Dict] = None, is_interruption: bool = False):
+        if not self.client: 
+            yield "My connection is hazy right now."
             return
+            
+        if not user_text.strip(): return
 
-        if not user_text.strip():
-            return
+        memory_text = f"[INTERRUPTION] {user_text}" if is_interruption else user_text
+        if is_interruption and self.short_term_memory and self.short_term_memory[-1]["role"] == "assistant":
+            self.short_term_memory[-1]["content"] += " [Note: You were cut off]"
 
-        # Update Short Term Memory
-        self.short_term_memory.append({"role": "user", "content": user_text})
-        if len(self.short_term_memory) > 10:
-            self.short_term_memory = self.short_term_memory[-10:]
+        self.short_term_memory.append({"role": "user", "content": memory_text})
+        if len(self.short_term_memory) > 10: self.short_term_memory = self.short_term_memory[-10:]
 
-        # Compile Prompt
         sensory_block = self._build_sensory_block(vision_context)
         final_system_prompt = self.base_system_prompt + self.long_term_context + sensory_block
-
         messages_payload = [{"role": "system", "content": final_system_prompt}] + self.short_term_memory
 
         full_response = ""
-
         try:
-            # ⚡ Groq API Call with stream=True
+            # ⚡ ENABLE STREAMING: This gets the first word back in ~0.1s
             stream = await self.client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=messages_payload,
                 temperature=0.65,
                 max_tokens=150,
                 top_p=0.9,
-                frequency_penalty=0.3, 
-                presence_penalty=0.3,
-                stream=True  # <--- This is the key to sub-second TTFB
+                stream=True 
             )
             
             async for chunk in stream:
-                token = chunk.choices[0].delta.content
-                if token:
-                    clean_token = self._clean_token(token)
-                    full_response += clean_token
+                if chunk.choices[0].delta.content is not None:
+                    token = chunk.choices[0].delta.content
                     
-                    # Yield the cleaned token back to the server.py router instantly
-                    if clean_token:
-                        yield clean_token
+                    # ⚡ Fix: Use the globally defined patterns
+                    token = CLEAN_PATTERN.sub('', token)
+                    token = EMOJI_PATTERN.sub('', token)
+                    
+                    if token:
+                        full_response += token
+                        yield token
 
-            # --- POST-GENERATION CLEANUP ---
-            final_clean_response = full_response.strip()
-            
-            if final_clean_response:
-                # Store the complete sentence in short term memory
-                self.short_term_memory.append({"role": "assistant", "content": final_clean_response})
+            if full_response.strip():
+                self.short_term_memory.append({"role": "assistant", "content": full_response.strip()})
                 
-                # Persist to DB asynchronously so it doesn't block
+                # Unblock the main thread while saving to the DB
                 if self.active_user_id:
                     asyncio.create_task(
-                        asyncio.to_thread(self._save_interaction_sync, self.active_user_id, user_text, final_clean_response)
+                        asyncio.to_thread(self._save_interaction_sync, self.active_user_id, memory_text, full_response.strip())
                     )
 
         except Exception as e:
             print(f"🧠 Thinking Error: {e}")
-            yield " Give me a second, I'm just catching my breath."
+            yield "Give me a second, I'm just catching my breath."

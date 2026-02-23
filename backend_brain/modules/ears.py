@@ -24,7 +24,7 @@ CPU_THREADS = max(4, multiprocessing.cpu_count() - 2) # Use available cores minu
 # ⚡ DYNAMIC VAD PARAMETERS (Normal vs. TTS Playing)
 VAD_THRESHOLD_NORMAL = 0.45                
 VAD_THRESHOLD_DUCKING = 0.75        
-SILENCE_LIMIT = 0.5                 
+SILENCE_LIMIT = 0.4       
 MIN_SPEECH_DURATION = 0.3           
 RMS_THRESHOLD_NORMAL = 0.005        
 RMS_THRESHOLD_DUCKING = 0.020       

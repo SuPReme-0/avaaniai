@@ -21,6 +21,9 @@ class StreamManager {
   private analyser: AnalyserNode | null = null;
   private audioQueue: { pcm: Int16Array; sampleRate: number; timestamp: number }[] = [];
   
+  // ⚡ TRACK ACTIVE NODES FOR INSTANT KILL (Barge-in)
+  private activeNodes: Set<AudioBufferSourceNode> = new Set();
+  
   private nextStartTime = 0;
   private listeners: Listener[] = [];
   private emotionState = { dominant: 'neutral', scores: {} as Record<string, number> };
@@ -28,10 +31,9 @@ class StreamManager {
   private lastPong = Date.now();
   private mediaStream: MediaStream | null = null;
   private micWorkletNode: AudioWorkletNode | null = null;
-  private workletUrl: string | null = null; // ⚡ For memory garbage collection
+  private workletUrl: string | null = null; 
   private isMicActive = false;
 
-  // ⚡ Session Cache for auto-reconnecting
   private userId = '';
   private username = '';
   private authToken?: string;
@@ -58,7 +60,7 @@ class StreamManager {
     this.userId = userId;
     this.username = username;
     if (token) this.authToken = token;
-    this.isIntentionalDisconnect = false; // Reset flag on explicit connect
+    this.isIntentionalDisconnect = false; 
 
     if (this.ws?.readyState === WebSocket.OPEN || this.ws?.readyState === WebSocket.CONNECTING) return;
     this.cleanupConnection();
@@ -70,7 +72,7 @@ class StreamManager {
     };
 
     this.ws = new WebSocket(getWsUrl());
-    this.ws.binaryType = 'arraybuffer'; 
+    this.ws.binaryType = 'arraybuffer'; // ⚡ Using fast binary pipeline
 
     this.ws.onopen = () => {
       console.log('✅ WebSocket Connected (Binary Mode)');
@@ -86,25 +88,52 @@ class StreamManager {
     };
 
     this.ws.onmessage = (event) => {
-      // FAST PATH: Binary audio
+      // ⚡ FAST PATH: Binary audio (Zero JSON parsing overhead)
       if (event.data instanceof ArrayBuffer) {
         const pcmData = new Int16Array(event.data);
         this.queueAudio(pcmData, this.currentSampleRate);
         return;
       }
-
-      // SLOW PATH: JSON Metadata
+// SLOW PATH: JSON Metadata & Base64 Audio
       try {
         const packet = JSON.parse(event.data);
 
         if (packet.type === 'ping') return this.sendJSON({ type: 'pong' });
         if (packet.type === 'pong') { this.lastPong = Date.now(); return; }
 
+        // ⚡ THE MISSING LINK: Decode Base64 Audio from the server instantly
+        if (packet.type === 'audio_chunk' && packet.payload) {
+          const binaryStr = atob(packet.payload);
+          const len = binaryStr.length;
+          const bytes = new Uint8Array(len);
+          for (let i = 0; i < len; i++) {
+              bytes[i] = binaryStr.charCodeAt(i);
+          }
+          const pcmData = new Int16Array(bytes.buffer);
+          
+          this.currentSampleRate = packet.sample_rate || 24000;
+          this.queueAudio(pcmData, this.currentSampleRate);
+          
+          // Apply bundled emotion immediately
+          if (packet.emotion) {
+              this.emotionState = { dominant: packet.emotion, scores: packet.emotion_scores || {} };
+              this.onEmotionUpdate?.(this.emotionState.dominant, this.emotionState.scores);
+          }
+          return;
+        }
+
         if (packet.type === 'audio_metadata') {
           this.currentSampleRate = packet.sample_rate || 24000;
           this.emotionState = { dominant: packet.emotion, scores: packet.emotion_scores || {} };
           this.onEmotionUpdate?.(this.emotionState.dominant, this.emotionState.scores);
           return; 
+        }
+
+        // ⚡ INSTANT BARGE-IN HANDLER
+        if (packet.type === 'status' && packet.mode === 'interrupted') {
+            this.flushAudio();
+            this.notify(packet as StreamEvent);
+            return;
         }
 
         if ('emotion' in packet && packet.emotion) {
@@ -117,8 +146,7 @@ class StreamManager {
         console.error('❌ JSON parse error:', e);
       }
     };
-
-    // ⚡ Suppress the useless generic error object
+    
     this.ws.onerror = () => {
         console.warn('⚠️ WebSocket Error (Connection may be dropping/refused).');
     };
@@ -128,7 +156,6 @@ class StreamManager {
       this.notify({ type: 'status', mode: 'disconnected' });
       if (this.isMicActive) this.stopMicrophone();
 
-      // ⚡ Only auto-reconnect if the disconnect wasn't intentional
       if (!this.isIntentionalDisconnect) {
         this.reconnectTimer = setTimeout(() => {
             this.reconnectAttempts++;
@@ -153,6 +180,25 @@ class StreamManager {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(data));
     }
+  }
+
+  // --------------------------------------------------------------------------
+  // AUDIO CONTROLS (INSTANT KILL)
+  // --------------------------------------------------------------------------
+  private flushAudio() {
+    // ⚡ 1. Stop all currently emitting hardware sound nodes instantly
+    this.activeNodes.forEach(node => {
+        try { node.stop(); } catch(e) {}
+    });
+    this.activeNodes.clear();
+
+    // ⚡ 2. Clear the buffer queue
+    this.audioQueue = [];
+    
+    // ⚡ 3. Reset timing and UI state
+    this.nextStartTime = this.playbackContext ? this.playbackContext.currentTime : 0;
+    this.activeSourceCount = 0;
+    this.onMouthStop?.();
   }
 
   // --------------------------------------------------------------------------
@@ -230,7 +276,6 @@ class StreamManager {
         this.micWorkletNode = null;
     }
     
-    // ⚡ Free up RAM immediately
     if (this.workletUrl) {
         URL.revokeObjectURL(this.workletUrl);
         this.workletUrl = null;
@@ -281,13 +326,23 @@ class StreamManager {
       this.activeSourceCount++;
 
       const now = this.playbackContext!.currentTime;
-      if (this.nextStartTime < now) this.nextStartTime = now + 0.01;
+      
+      // ⚡ ANTI-DRIFT CORRECTION:
+      // If the scheduled time falls behind the hardware clock (due to network lag),
+      // snap it forward to 'now' + 15ms buffer to prevent clipping.
+      if (this.nextStartTime < now) {
+          this.nextStartTime = now + 0.015; 
+      }
 
       source.start(this.nextStartTime);
+      this.activeNodes.add(source); // Track node for barge-in
+
       this.nextStartTime += audioBuffer.duration;
 
       source.onended = () => {
         this.activeSourceCount--;
+        this.activeNodes.delete(source); // Cleanup completed nodes
+        
         if (this.activeSourceCount === 0 && this.audioQueue.length === 0) {
           this.onMouthStop?.();
         }
@@ -300,16 +355,12 @@ class StreamManager {
     if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.ws) { 
-        // Only trigger close if not already closing/closed
         if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) {
             this.ws.close(); 
         }
         this.ws = null; 
     }
-    this.audioQueue = [];
-    this.nextStartTime = 0;
-    this.activeSourceCount = 0;
-    this.isScheduling = false;
+    this.flushAudio(); // Safely stop audio and reset state
   }
 
   disconnect() {
@@ -318,7 +369,6 @@ class StreamManager {
     this.cleanupConnection();
     this.stopMicrophone();
     
-    // ⚡ PREVENT HARDWARE LIMIT REACHED: Explicitly destroy AudioContexts
     if (this.playbackContext) {
         this.playbackContext.close().catch(console.error);
         this.playbackContext = null;
