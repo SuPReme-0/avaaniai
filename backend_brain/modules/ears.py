@@ -18,7 +18,7 @@ MODEL_PATH = os.path.join(CURRENT_DIR, "../../models", MODEL_DIR_NAME)
 
 # ⚡ INTEL CPU OPTIMIZATIONS
 DEVICE = "cpu"                    
-COMPUTE_TYPE = "int8"               # CRITICAL: Forces 8-bit math for CPU speed
+COMPUTE_TYPE = "float32"               # CRITICAL: Forces 8-bit math for CPU speed
 CPU_THREADS = max(4, multiprocessing.cpu_count() - 2) # Use available cores minus 2 for OS stability
 
 # ⚡ DYNAMIC VAD PARAMETERS (Normal vs. TTS Playing)
